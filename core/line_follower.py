@@ -163,21 +163,18 @@ class LineDetector:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
-        # TODO-B4【拟合、横向误差与方向角】
-        # 已给出拟合输入。请完成：
-        #   1) 用 np.polyfit(ys, xs, 1) 得到 x = a*y + b；
-        #   2) 在 ROI 最底行 ref_y 计算 cx_fit；
-        #   3) error_px = cx_fit - ww/2，线在右侧时应为正；
-        #   4) 因图像 y 轴向下，方向角可由 atan(-a) 得到并转为角度；
-        #   5) 用一阶 EMA 更新 self._prev_cx，供下一帧滑窗预测。
-        # 验收：人工平移直线时误差符号正确，倾斜线角度符号正确且连续。
+        # TODO-B4【二次拟合、横向误差与方向角】
+        # 用 x = q2*y^2 + q1*y + q0 描述平滑弯道；车头参考点取
+        # ROI 最底行，方向角取该点切线 dx/dy = 2*q2*y + q1。
         ys = np.asarray([p[1] for p in points], dtype=np.float64)
         xs = np.asarray([p[0] for p in points], dtype=np.float64)
-        a, b = np.polyfit(ys, xs, 1)
+        q2, q1, q0 = np.polyfit(ys, xs, 2)
         ref_y = roi_top + roi_h - 1
-        cx_fit = float(np.clip(a * ref_y + b, 0.0, ww - 1.0))
+        cx_fit = float(np.clip(q2 * ref_y ** 2 + q1 * ref_y + q0,
+                               0.0, ww - 1.0))
         error_px = cx_fit - ww / 2.0
-        angle_deg = math.degrees(math.atan(-a))
+        tangent = 2.0 * q2 * ref_y + q1
+        angle_deg = math.degrees(math.atan(-tangent))
         if self._prev_cx is None:
             self._prev_cx = cx_fit
         else:
@@ -188,7 +185,7 @@ class LineDetector:
             'centroid': (cx_fit, float(ref_y)),
             'error_px': float(error_px),          # 线在右 → 正 → 右转
             'angle_deg': float(angle_deg),
-            'a': a, 'b': b,                     # 主直线参数 x=a*y+b（调试画线用）
+            'fit_coeffs': (float(q2), float(q1), float(q0)),
             'points': points,                   # 参与拟合的点
             'binary': binary,
             'roi_top': roi_top,
@@ -693,14 +690,16 @@ class LineFollower:
                 cv2.circle(disp, (int(x * s), int(y * s)), 3, (0, 255, 0), -1)
             y_top = min(p[1] for p in det['points'])
             y_bot = max(p[1] for p in det['points'])
-            x_top = int((det['a'] * y_top + det['b']) * s)
-            x_bot = int((det['a'] * y_bot + det['b']) * s)
-            cv2.line(disp, (x_top, int(y_top * s)),
-                     (x_bot, int(y_bot * s)), (0, 255, 0), 2)
+            fit_ys = np.linspace(y_top, y_bot, 40)
+            fit_xs = np.polyval(det['fit_coeffs'], fit_ys)
+            curve = np.column_stack((fit_xs * s, fit_ys * s))
+            curve[:, 0] = np.clip(curve[:, 0], 0, disp_w - 1)
+            cv2.polylines(disp, [np.rint(curve).astype(np.int32)], False,
+                          (0, 255, 0), 2, lineType=cv2.LINE_AA)
             cx, cy = det['centroid']
             cv2.circle(disp, (int(cx * s), int(cy * s)), 6, (0, 255, 255), -1)
 
-        info = (f"state={state} x={speed}mm/s z={z:.0f}d/s | "
+        info = (f"state={state} x={speed}mm/s z={z:.0f}mrad/s | "
                 f"err={det['error_px']:.1f}px ang={det['angle_deg']:.1f}deg | "
                 f"polar={det['line_type']} fps={self.fps:.0f}")
         cv2.putText(disp, info, (8, 20), cv2.FONT_HERSHEY_SIMPLEX,

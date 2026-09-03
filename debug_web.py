@@ -441,10 +441,15 @@ class DebugWebServer:
         if det.get('is_valid') and det.get('points'):
             y0 = min(p[1] for p in det['points'])
             y1 = max(p[1] for p in det['points'])
-            x0 = det['a'] * y0 + det['b']
-            x1 = det['a'] * y1 + det['b']
-            cv2.line(raw, (int(x0 * scale), int(y0 * scale)),
-                     (int(x1 * scale), int(y1 * scale)), (0, 255, 255), 3)
+            coeffs = det.get('fit_coeffs')
+            if coeffs is not None and len(coeffs) == 3:
+                fit_ys = np.linspace(y0, y1, 40)
+                fit_xs = np.polyval(coeffs, fit_ys)
+                curve = np.column_stack((fit_xs * scale, fit_ys * scale))
+                curve[:, 0] = np.clip(curve[:, 0], 0, work_width - 1)
+                curve[:, 1] = np.clip(curve[:, 1], 0, work_height - 1)
+                cv2.polylines(raw, [np.rint(curve).astype(np.int32)], False,
+                              (0, 255, 255), 3, lineType=cv2.LINE_AA)
         cv2.putText(raw, 'RAW + FIT', (12, 26), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (0, 255, 255), 2)
 
