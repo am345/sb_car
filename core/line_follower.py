@@ -518,6 +518,7 @@ class LineFollower:
         self._corner_turn_radians = 0.0
         self._corner_confirm_dir = 0
         self._corner_confirm_count = 0
+        self._corner_exit_frames = 0  # 完成一个 L 后短暂忽略旧拐角，允许连续 L
         self.fps = 0.0
         self._fps_n = 0
         self._fps_t = time.time()
@@ -556,7 +557,12 @@ class LineFollower:
                 angle = det['angle_deg']
                 p_term = d_term = angle_term = 0.0
 
-                observed_corner = int(det.get('corner_dir', 0))
+                detected_corner = int(det.get('corner_dir', 0))
+                if self._corner_exit_frames > 0:
+                    self._corner_exit_frames -= 1
+                    observed_corner = 0
+                else:
+                    observed_corner = detected_corner
                 corner_near = float(det.get('corner_y_ratio', 0.0)) >= 0.52
                 if (self._corner_dir == 0 and self._started and
                         det['is_valid'] and observed_corner and corner_near):
@@ -617,6 +623,7 @@ class LineFollower:
                         self._corner_turn_radians = 0.0
                         self._corner_confirm_dir = 0
                         self._corner_confirm_count = 0
+                        self._corner_exit_frames = 15
                         self._has_prev = False
                         self._last_z = 0.0
                     elif not corner_handled:
@@ -634,23 +641,40 @@ class LineFollower:
                         turn_complete = (self._corner_turn_radians >= self.corner_turn_radians or
                                          self._corner_frames > 110)
                         if turn_complete:
-                            raw_z = 0.0
+                            logger.info('%s L 弯旋转完成 %.1f°，进入低速循迹退出阶段',
+                                        '左' if self._corner_dir < 0 else '右',
+                                        math.degrees(self._corner_turn_radians))
+                            self._corner_dir = 0
+                            self._corner_frames = 0
+                            self._corner_phase = ''
+                            self._corner_turn_radians = 0.0
+                            self._corner_confirm_dir = 0
+                            self._corner_confirm_count = 0
+                            self._corner_exit_frames = 15
+                            self._has_prev = False
+                            self._last_z = 0.0
+                            z = 0
+                            speed = 0
+                            state = 'corner-exit'
+                            if self.chassis.send_speed(0, 0, 0):
+                                send_fail = 0
+                            else:
+                                send_fail += 1
+                            corner_handled = True
                         else:
                             self._corner_turn_radians += abs(raw_z) * dt / 1000.0
-                        self._last_z = raw_z
-                        z = -raw_z if self.z_invert else raw_z
-                        if self.base_speed <= 0:
-                            z = 0
-                        speed = 0
-                        state = ('corner-left' if self._corner_dir < 0
-                                 else 'corner-right')
-                        if turn_complete:
-                            state = 'corner-stop'
-                        if self.chassis.send_speed(0, 0, int(z)):
-                            send_fail = 0
-                        else:
-                            send_fail += 1
-                        corner_handled = True
+                            self._last_z = raw_z
+                            z = -raw_z if self.z_invert else raw_z
+                            if self.base_speed <= 0:
+                                z = 0
+                            speed = 0
+                            state = ('corner-left' if self._corner_dir < 0
+                                     else 'corner-right')
+                            if self.chassis.send_speed(0, 0, int(z)):
+                                send_fail = 0
+                            else:
+                                send_fail += 1
+                            corner_handled = True
 
                 if corner_handled:
                     pass
@@ -736,7 +760,12 @@ class LineFollower:
                         speed = int(round(self.base_speed * ramp * curve_scale))
                         if abs(err) > 40:
                             speed = min(speed, int(round(self.base_speed * 0.3)))
-                        if observed_corner:
+                        if self._corner_exit_frames > 0:
+                            # 已完成的旧拐角可能仍在高位摄像头视野内。退出阶段
+                            # 保留正常循迹转向，只限制前进速度，避免再次触发旧 L。
+                            speed = min(speed, int(round(self.base_speed * 0.35)))
+                            state = 'corner-exit'
+                        elif observed_corner:
                             # 拐点尚远时继续沿主干靠近，但预先减速；达到触发线后
                             # 上面的确认逻辑会切换为原地转向。
                             speed = min(speed, int(round(self.base_speed * 0.35)))
@@ -786,6 +815,7 @@ class LineFollower:
                         'started': self._started,
                         'binary_mode': self.detector.binary_mode,
                         'corner_phase': self._corner_phase,
+                        'corner_exit_frames': self._corner_exit_frames,
                         'corner_delay_frames': self.corner_delay_frames,
                         'corner_delay_speed': self.corner_delay_speed,
                         'corner_turn_target_deg': math.degrees(self.corner_turn_radians),
