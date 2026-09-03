@@ -110,6 +110,8 @@ def main():
                         help='确认L弯后延迟直行阶段的速度 mm/s（默认40）')
     parser.add_argument('--corner-turn-degrees', type=float, default=78.0,
                         help='L弯原地旋转的目标角度（度，默认78）')
+    parser.add_argument('--corner-turn-speed', type=int, default=300,
+                        help='L弯原地旋转的目标速度 mrad/s（默认300）')
     parser.add_argument('--start-rotate', action='store_true',
                         help='起步时原地转向对准线后再前进(默认关:静止确认后边前进边修正)')
     parser.add_argument('--roi-top', type=float, default=0.45,
@@ -214,6 +216,7 @@ def main():
         corner_delay_frames=args.corner_delay_frames,
         corner_delay_speed=args.corner_delay_speed,
         corner_turn_degrees=args.corner_turn_degrees,
+        corner_turn_speed=args.corner_turn_speed,
         start_rotate=args.start_rotate,
         work_width=args.work_width,
         roi_top_ratio=args.roi_top,

@@ -441,6 +441,7 @@ class LineFollower:
       corner_delay_frames 确认L弯后低速直行多少帧再转向；越大转得越晚(默认10)
       corner_delay_speed  L弯延迟直行阶段的速度 mm/s(默认40)
       corner_turn_degrees L弯原地旋转的目标角度；越大转得越多(默认78度)
+      corner_turn_speed   L弯原地旋转的目标速度 mrad/s(默认300)
       start_rotate   起步确认期间是否原地转向对准线(默认False:静止确认后边前进边修正)
     """
 
@@ -451,7 +452,7 @@ class LineFollower:
                  lost_hold=10, search_frames=15,
                  startup_frames=5, ramp_frames=20,
                  corner_delay_frames=10, corner_delay_speed=40,
-                 corner_turn_degrees=78.0,
+                 corner_turn_degrees=78.0, corner_turn_speed=300,
                  start_rotate=False,
                  work_width=320, roi_top_ratio=0.45,
                  n_scan_rows=12, scan_start_ratio=0.25,
@@ -479,6 +480,7 @@ class LineFollower:
         self.corner_delay_speed = max(0, int(corner_delay_speed))
         self.corner_turn_radians = math.radians(
             float(np.clip(corner_turn_degrees, 10.0, 180.0)))
+        self.corner_turn_speed = int(np.clip(corner_turn_speed, 50, 1000))
         self.start_rotate = start_rotate      # 起步是否原地转向对准线(默认关，静止确认后前进)
 
         self.detector = LineDetector(
@@ -617,7 +619,8 @@ class LineFollower:
                         self._has_prev = False
                         self._filtered_err = 0.0
                         self._filtered_angle = 0.0
-                        turn_limit = min(abs(float(self.max_z)), 300.0)
+                        turn_limit = min(abs(float(self.max_z)),
+                                         float(self.corner_turn_speed))
                         turn_mag = min(turn_limit,
                                        100.0 + self._corner_frames * 15.0)
                         raw_z = self._corner_dir * turn_mag
@@ -780,6 +783,7 @@ class LineFollower:
                         'corner_delay_frames': self.corner_delay_frames,
                         'corner_delay_speed': self.corner_delay_speed,
                         'corner_turn_target_deg': math.degrees(self.corner_turn_radians),
+                        'corner_turn_speed': self.corner_turn_speed,
                         'corner_turn_deg': math.degrees(self._corner_turn_radians),
                     })
                     if self.web_debug.restart_requested:
