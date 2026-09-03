@@ -20,6 +20,7 @@
 import logging
 import math
 import time
+from itertools import combinations
 
 import cv2
 import numpy as np
@@ -177,6 +178,18 @@ class LineDetector:
             if len(stem_points) >= 3:
                 points = stem_points
 
+        # 地缝、反光边缘常只贡献一两个远离主线的扫描点。先选取横向
+        # 位置连续的最长点链，再做稳健二次拟合，避免端点把曲线拉飞。
+        points = self._select_continuous_path(points)
+        if len(points) < 3:
+            self._prev_cx = None
+            return self._empty_result(binary=binary, roi_top=roi_top)
+
+        fit_coeffs, points = self._robust_quadratic_fit(points)
+        if fit_coeffs is None or len(points) < 3:
+            self._prev_cx = None
+            return self._empty_result(binary=binary, roi_top=roi_top)
+
         # 道路线必须延伸到近车头区域。只在 ROI 中上部出现的细长物体
         # （例如电线）即使能提供多个扫描点，也不能向底部外推成道路。
         near_y = roi_top + int(roi_h * 0.80)
@@ -188,9 +201,7 @@ class LineDetector:
         # TODO-B4【二次拟合、横向误差与方向角】
         # 用 x = q2*y^2 + q1*y + q0 描述平滑弯道；车头参考点取
         # ROI 最底行，方向角取该点切线 dx/dy = 2*q2*y + q1。
-        ys = np.asarray([p[1] for p in points], dtype=np.float64)
-        xs = np.asarray([p[0] for p in points], dtype=np.float64)
-        q2, q1, q0 = np.polyfit(ys, xs, 2)
+        q2, q1, q0 = fit_coeffs
         ref_y = roi_top + roi_h - 1
         cx_fit = float(np.clip(q2 * ref_y ** 2 + q1 * ref_y + q0,
                                0.0, ww - 1.0))
@@ -214,6 +225,54 @@ class LineDetector:
             'roi_top': roi_top,
             'line_type': self.polarity,
         }
+
+    def _select_continuous_path(self, points):
+        """保留横向连续的最长扫描点链，剔除跳到地缝/反光边缘的点。"""
+        if len(points) < 3:
+            return list(points)
+        ordered = sorted(points, key=lambda point: point[1])
+        max_step = max(18.0, min(45.0, self.track_half * 0.65))
+        runs = []
+        current = [ordered[0]]
+        for point in ordered[1:]:
+            if abs(float(point[0]) - float(current[-1][0])) <= max_step:
+                current.append(point)
+            else:
+                runs.append(current)
+                current = [point]
+        runs.append(current)
+        # 同长度时优先选择延伸到更靠近车头的位置。
+        return max(runs, key=lambda run: (len(run), run[-1][1]))
+
+    @staticmethod
+    def _robust_quadratic_fit(points, residual_limit=8.0):
+        """穷举三点模型，以内点数量选二次曲线并重新拟合。"""
+        if len(points) < 3:
+            return None, []
+        ys = np.asarray([point[1] for point in points], dtype=np.float64)
+        xs = np.asarray([point[0] for point in points], dtype=np.float64)
+        best_indices = np.arange(len(points))
+        best_score = (-1, float('-inf'))
+        for sample in combinations(range(len(points)), 3):
+            sample_idx = np.asarray(sample)
+            try:
+                coeffs = np.polyfit(ys[sample_idx], xs[sample_idx], 2)
+            except (ValueError, np.linalg.LinAlgError):
+                continue
+            residuals = np.abs(xs - np.polyval(coeffs, ys))
+            inliers = np.flatnonzero(residuals <= residual_limit)
+            if inliers.size < 3:
+                continue
+            score = (int(inliers.size), -float(np.mean(residuals[inliers])))
+            if score > best_score:
+                best_score = score
+                best_indices = inliers
+        try:
+            coeffs = np.polyfit(ys[best_indices], xs[best_indices], 2)
+        except (ValueError, np.linalg.LinAlgError):
+            return None, []
+        inlier_points = [points[int(index)] for index in best_indices]
+        return tuple(float(value) for value in coeffs), inlier_points
 
     # ------------------------------------------------------------------
     def _scan_lines(self, binary, roi_top, ww, inside, pred):
