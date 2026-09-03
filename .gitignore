@@ -3,4 +3,4 @@ __pycache__/
 *.log
 *.tmp
 *:Zone.Identifier
-
+image_logs/

@@ -98,7 +98,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
 </head>
 <body><main>
   <header><div><h1>视觉循迹实时调试</h1><div class="sub">RAW + 拟合结果 / BINARY 检测区</div></div>
-    <div id="connection" class="warn">正在连接…</div></header>
+    <div><a href="/logs" style="color:var(--cyan);margin-right:14px">图像日志</a><span id="connection" class="warn">正在连接…</span></div></header>
   <section class="layout">
     <div class="card"><div class="video-head"><span>实时画面</span><span id="frame">frame --</span></div>
       <img id="stream" src="/stream.mjpg" alt="debug stream"></div>
@@ -190,6 +190,20 @@ loadConfig().catch(e=>$('saveResult').textContent='读取参数失败：'+e.mess
 </script></body></html>"""
 
 
+_LOGS_HTML = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>图像日志</title><style>
+body{margin:0;background:#07101c;color:#e7edf5;font:14px system-ui,sans-serif}main{width:min(1500px,96vw);margin:20px auto}
+a{color:#54d6ff}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+.item{border:1px solid #26364c;border-radius:10px;overflow:hidden;background:#101a29}.item img{display:block;width:100%}.name{padding:8px 10px;color:#a8b3c2;font-family:monospace}
+</style></head><body><main><div class="head"><div><h1>图像日志</h1><div>每秒一张，最多保留最近 300 张</div></div><a href="/">返回实时页面</a></div><div id="grid" class="grid">加载中…</div></main>
+<script>
+async function refresh(){const r=await fetch('/api/image-logs',{cache:'no-store'}),d=await r.json(),g=document.getElementById('grid');g.innerHTML='';
+for(const x of d.logs){const box=document.createElement('div');box.className='item';const a=document.createElement('a');a.href=x.url;a.target='_blank';const img=document.createElement('img');img.src=x.url;img.loading='lazy';a.appendChild(img);const name=document.createElement('div');name.className='name';name.textContent=x.name;box.append(a,name);g.appendChild(box)}if(!d.logs.length)g.textContent='暂无图像日志';}
+refresh();setInterval(refresh,5000);
+</script></body></html>"""
+
+
 class DebugWebServer:
     """Stores the latest telemetry/frame and serves them over localhost."""
 
@@ -206,6 +220,11 @@ class DebugWebServer:
         self._status = {'state': 'starting', 'updated_at': time.time()}
         self._config = dict(config or {})
         self.config_path = config_path
+        self.image_log_dir = (os.path.join(os.path.dirname(config_path), 'image_logs')
+                              if config_path else None)
+        self.image_log_interval = 1.0
+        self.image_log_limit = 300
+        self._last_image_log = 0.0
         self._restart_after = None
         self._httpd = None
         self._thread = None
@@ -222,6 +241,12 @@ class DebugWebServer:
                 time.monotonic() >= self._restart_after)
 
     def start(self):
+        if self.image_log_dir:
+            try:
+                os.makedirs(self.image_log_dir, exist_ok=True)
+            except OSError as exc:
+                logger.warning('无法创建图像日志目录 %s: %s', self.image_log_dir, exc)
+                self.image_log_dir = None
         self._httpd = ThreadingHTTPServer((self.host, self.port), _RequestHandler)
         self._httpd.daemon_threads = True
         self._httpd.dashboard = self
@@ -262,6 +287,11 @@ class DebugWebServer:
                     jpeg = encoded.tobytes()
                     self._last_encode = now
 
+        if (jpeg is not None and self.image_log_dir and
+                now - self._last_image_log >= self.image_log_interval):
+            self._save_image_log(jpeg, status)
+            self._last_image_log = now
+
         with self._condition:
             self._status = status
             if jpeg is not None:
@@ -276,6 +306,48 @@ class DebugWebServer:
     def get_config(self):
         with self._condition:
             return dict(self._config)
+
+    def get_image_logs(self):
+        if not self.image_log_dir:
+            return []
+        try:
+            names = sorted(
+                (entry.name for entry in os.scandir(self.image_log_dir)
+                 if entry.is_file() and entry.name.endswith('.jpg')),
+                reverse=True)
+        except OSError:
+            return []
+        return [{'name': name, 'url': '/image-logs/' + name}
+                for name in names[:self.image_log_limit]]
+
+    def read_image_log(self, name):
+        if (not self.image_log_dir or os.path.basename(name) != name or
+                not name.endswith('.jpg')):
+            return None
+        try:
+            with open(os.path.join(self.image_log_dir, name), 'rb') as stream:
+                return stream.read()
+        except OSError:
+            return None
+
+    def _save_image_log(self, jpeg, status):
+        state = ''.join(c if c.isalnum() or c in '-_' else '-'
+                        for c in str(status.get('state', 'unknown')))
+        stamp = time.strftime('%Y%m%d_%H%M%S')
+        frame_count = int(status.get('frame_count', 0))
+        name = f'{stamp}_{state}_f{frame_count:08d}.jpg'
+        try:
+            with open(os.path.join(self.image_log_dir, name), 'wb') as stream:
+                stream.write(jpeg)
+            entries = sorted(
+                (entry for entry in os.scandir(self.image_log_dir)
+                 if entry.is_file() and entry.name.endswith('.jpg')),
+                key=lambda entry: entry.name, reverse=True)
+            for entry in entries[self.image_log_limit:]:
+                os.unlink(entry.path)
+        except OSError as exc:
+            logger.warning('写入图像日志失败，已停用: %s', exc)
+            self.image_log_dir = None
 
     def save_config(self, submitted):
         if not isinstance(submitted, dict):
@@ -385,6 +457,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
         if path == '/':
             self._send_bytes(200, 'text/html; charset=utf-8',
                              _DASHBOARD_HTML.encode('utf-8'))
+        elif path == '/logs':
+            self._send_bytes(200, 'text/html; charset=utf-8',
+                             _LOGS_HTML.encode('utf-8'))
         elif path == '/api/status':
             payload = json.dumps(self.dashboard.get_status(), ensure_ascii=False,
                                  allow_nan=False).encode('utf-8')
@@ -393,6 +468,16 @@ class _RequestHandler(BaseHTTPRequestHandler):
             payload = json.dumps(self.dashboard.get_config(), ensure_ascii=False,
                                  allow_nan=False).encode('utf-8')
             self._send_bytes(200, 'application/json; charset=utf-8', payload)
+        elif path == '/api/image-logs':
+            payload = json.dumps({'logs': self.dashboard.get_image_logs()},
+                                 ensure_ascii=False).encode('utf-8')
+            self._send_bytes(200, 'application/json; charset=utf-8', payload)
+        elif path.startswith('/image-logs/'):
+            payload = self.dashboard.read_image_log(path[len('/image-logs/'):])
+            if payload is None:
+                self._send_bytes(404, 'text/plain; charset=utf-8', b'Not found')
+            else:
+                self._send_bytes(200, 'image/jpeg', payload)
         elif path == '/stream.mjpg':
             self._stream_mjpeg()
         elif path == '/favicon.ico':
