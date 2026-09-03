@@ -167,6 +167,14 @@ class LineDetector:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
+        # 道路线必须延伸到近车头区域。只在 ROI 中上部出现的细长物体
+        # （例如电线）即使能提供多个扫描点，也不能向底部外推成道路。
+        near_y = roi_top + int(roi_h * 0.80)
+        near_points = [point for point in points if point[1] >= near_y]
+        if len(near_points) < 2:
+            self._prev_cx = None
+            return self._empty_result(binary=binary, roi_top=roi_top)
+
         # TODO-B4【二次拟合、横向误差与方向角】
         # 用 x = q2*y^2 + q1*y + q0 描述平滑弯道；车头参考点取
         # ROI 最底行，方向角取该点切线 dx/dy = 2*q2*y + q1。
@@ -250,7 +258,11 @@ class LineDetector:
             if best_s < 0:
                 continue
             bw = best_e - best_s
-            if bw < self.min_seg_width:
+            # 利用透视关系过滤细电线：远处道路允许较窄，越靠近车头
+            # 对线宽要求越高。工作图宽度默认为 320，此时门槛约为 3~8 px。
+            y_ratio = rel_y / max(1, roi_h - 1)
+            perspective_min_width = int(round(3 + 5 * y_ratio))
+            if bw < max(self.min_seg_width, perspective_min_width):
                 continue
             cx = l0 + (best_s + best_e) // 2
             points.append((cx, rel_y + roi_top, bw))
@@ -268,8 +280,21 @@ class LineDetector:
         rows = []
         for y in range(roi_h):
             xs = np.flatnonzero(binary[y])
-            if xs.size >= self.min_seg_width:
-                rows.append((y, int(xs[0]), int(xs[-1]), int(xs.size)))
+            if xs.size < self.min_seg_width:
+                continue
+
+            # 只使用本行最长的连续前景段。直接用 xs[0]~xs[-1] 会把墙脚、
+            # 阴影等互不相连的黑块合并成一条很长的“横臂”，造成假 L 弯。
+            breaks = np.flatnonzero(np.diff(xs) > 1)
+            starts = np.r_[0, breaks + 1]
+            ends = np.r_[breaks + 1, xs.size]
+            lengths = ends - starts
+            best = int(np.argmax(lengths))
+            seg_left = int(xs[starts[best]])
+            seg_right = int(xs[ends[best] - 1])
+            seg_width = int(lengths[best])
+            if seg_width >= self.min_seg_width:
+                rows.append((y, seg_left, seg_right, seg_width))
         if len(rows) < 6:
             return empty
 
@@ -282,7 +307,7 @@ class LineDetector:
         if len(lower) < 4:
             return empty
         normal_width = float(np.median([item[3] for item in lower]))
-        if span < max(ww * 0.12, normal_width * 1.6):
+        if span < max(ww * 0.16, normal_width * 2.0):
             return empty
 
         # 用横臂下方的主干中心确定拐点，避免把整条横臂的中点当作道路中心。
@@ -525,13 +550,14 @@ class LineFollower:
                     else:
                         self._corner_confirm_dir = observed_corner
                         self._corner_confirm_count = 1
-                    if self._corner_confirm_count >= 2:
+                    if self._corner_confirm_count >= 4:
                         self._corner_dir = observed_corner
                         self._corner_frames = 0
                         self._corner_phase = 'advance'
                         self._corner_turn_radians = 0.0
-                        logger.info('确认%s L 弯，先低速直行越过拐点',
-                                    '左' if observed_corner < 0 else '右')
+                        logger.info('连续4帧确认%s L 弯，跨度=%.0fpx，先低速直行越过拐点',
+                                    '左' if observed_corner < 0 else '右',
+                                    float(det.get('corner_span', 0.0)))
                 elif self._corner_dir == 0:
                     self._corner_confirm_dir = 0
                     self._corner_confirm_count = 0

@@ -279,6 +279,7 @@ class DebugWebServer:
         status['polarity'] = det.get('line_type', '')
         status['corner_dir'] = int(det.get('corner_dir', 0))
         status['corner_y_ratio'] = float(det.get('corner_y_ratio', 0.0))
+        status['corner_span'] = float(det.get('corner_span', 0.0))
 
         jpeg = None
         now = time.monotonic()
