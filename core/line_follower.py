@@ -15,7 +15,7 @@
   A2 左/右直角转弯：分别完成 90° 左转和右转，转弯前降速，转弯后
      重新稳定捕获线路；识别失败、超时、相机或串口异常必须停车。
 
-底盘输出约定：x 为前进速度(mm/s)，z 为转向角速度(度/s)。
+底盘输出约定：x 为前进速度(mm/s)，z 为转向角速度(mrad/s)。
 """
 import logging
 import math
@@ -347,7 +347,7 @@ class LineFollower:
 
     参数（均为底盘串口约定单位）：
       base_speed  直道巡航速度 mm/s
-      max_z       最大转向速度 度/s
+      max_z       最大转向速度 mrad/s
       kp / kd / ka  横向误差比例/微分/角度前馈增益
       err_alpha   误差/角度低通滤波系数(0~1)
       lost_hold   失线低速直行的帧数上限，超过则停车
@@ -378,7 +378,7 @@ class LineFollower:
         self.kd = kd
         self.ka = ka
         self.err_alpha = err_alpha
-        self.z_rate_limit = z_rate_limit    # 每帧最大转向增量(°/s)，防猛甩
+        self.z_rate_limit = z_rate_limit    # 每帧最大转向增量(mrad/s)，防猛甩
         self.lost_hold = lost_hold
         self.search_frames = search_frames  # 失线后低速旋转搜索的帧数
         self.z_invert = z_invert            # 转向方向取反(硬件/装向与协议约定相反时使用)
@@ -416,7 +416,7 @@ class LineFollower:
     # ------------------------------------------------------------------
     def run(self, max_frames=None):
         """主循环。"""
-        logger.info('巡线启动: 极性=%s base=%dmm/s max_z=%d°/s',
+        logger.info('巡线启动: 极性=%s base=%dmm/s max_z=%dmrad/s',
                     self.detector.polarity, self.base_speed, self.max_z)
         frame_count = 0
         last_t = time.time()
@@ -480,7 +480,7 @@ class LineFollower:
                     z = float(np.clip(
                         z_raw, -abs(self.max_z), abs(self.max_z)))
 
-                    # 转向速率限制：单帧最多变化 z_rate_limit °/s，防车身猛甩
+                    # 转向速率限制：单帧最多变化 z_rate_limit mrad/s，防车身猛甩
                     dz = z - self._last_z
                     if abs(dz) > self.z_rate_limit:
                         z = self._last_z + self.z_rate_limit * (1 if dz > 0 else -1)
@@ -601,12 +601,12 @@ class LineFollower:
                     real_dps = ''
                     st = self.chassis.read_status()
                     if st is not None:
-                        real_dps = f" 实转z={st['real_z'] * 57.3:+.0f}°/s"  # mrad/s -> °/s
+                        real_dps = f" 实转z={st['real_z'] * 1000:+.0f}mrad/s"
                         real_dps += f" 实x/y={st['real_x']:+d}/{st['real_y']:+d}mm/s"
                         real_dps += f" 陀螺z={st['ang_vel_z']:+d}"
                     logger.info(
                         '状态=%-8s 极性=%-5s | err=%6.1fpx 角度=%5.1f° | '
-                        '速度=%3dmm/s 转向=%4d°/s | FPS=%.0f | 失帧=%d%s',
+                        '速度=%3dmm/s 转向=%4dmrad/s | FPS=%.0f | 失帧=%d%s',
                         state, det['line_type'], err, angle,
                         int(speed), int(z), self.fps, self._no_frame_count, real_dps)
 

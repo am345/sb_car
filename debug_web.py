@@ -110,7 +110,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
         <div class="metric"><div class="label">横向误差</div><div id="error" class="value">--</div></div>
         <div class="metric"><div class="label">方向角</div><div id="angle" class="value">--</div></div>
         <div class="metric"><div class="label">前进速度</div><div id="speed" class="value">--</div></div>
-        <div class="metric"><div class="label">转向速度</div><div id="turn" class="value">--</div></div>
+        <div class="metric"><div class="label">转向速度 mrad/s</div><div id="turn" class="value">--</div></div>
       </div>
       <div class="bars">
         <div><div class="bar-label"><span>转向负载</span><span id="turnPct">--</span></div><div class="track"><div id="turnBar" class="fill"></div></div></div>
@@ -133,7 +133,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
 <script>
 const $=id=>document.getElementById(id), num=(v,n=1)=>Number(v||0).toFixed(n);
 const fields=[
- ['speed','巡航速度 mm/s','number','1'],['max_z','最大转向 °/s','number','1'],
+ ['speed','巡航速度 mm/s','number','1'],['max_z','最大转向 mrad/s','number','1'],
  ['kp','P 增益','number','0.1'],['kd','D 增益','number','0.1'],['ka','角度前馈','number','0.1'],
  ['err_alpha','滤波系数','number','0.05'],['z_rate','转向变化限制','number','1'],
  ['roi_top','ROI 起点','number','0.05'],['scan_start','扫描起点','number','0.05'],

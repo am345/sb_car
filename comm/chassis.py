@@ -6,19 +6,18 @@
   - 指令帧(11 字节): 0x7B 0x00 0x00 [x_hi x_lo] [y_hi y_lo] [z_hi z_lo] BCC 0x7D
       BCC = 第0~8字节按位异或；
       x/y: 前进/横移  单位 mm/s，限幅 ±300；
-      z  : 转向      单位 度/s，限幅 ±1500。
+      z  : 转向      单位 mrad/s，限幅 ±1500。
   - 方向约定: x>0 前进 / x<0 后退；y>0 左移 / y<0 右移；z>0 右转 / z<0 左转。
   - 状态帧(24 字节): 0x7B ... [BCC] 0x7D，BCC = 第0~21字节异或，位于第22字节。
 
 用法示例：
     chassis = ChassisController()
     chassis.connect()                    # 自动识别串口
-    chassis.send_speed(150, 0, -300)     # 前进150mm/s 并左转300度/s
+    chassis.send_speed(150, 0, -300)     # 前进150mm/s 并以0.3rad/s左转
     chassis.send_ros_vel(0.15, -0.5)     # 或使用 ROS 风格速度(线性m/s, 角速度rad/s)
     chassis.stop()
     chassis.close()
 """
-import math
 import time
 
 import serial
@@ -99,7 +98,7 @@ class ChassisController:
         return max(-limit, min(limit, value))
 
     def send_speed(self, x=0, y=0, z=0):
-        """按底盘原始约定发送速度：x/y 单位 mm/s，z 单位 度/s。"""
+        """按底盘原始约定发送速度：x/y 单位 mm/s，z 单位 mrad/s。"""
         if not self.is_connected:
             return False
         x = int(round(self._clamp(x, 'x')))
@@ -136,8 +135,8 @@ class ChassisController:
         内部转换为底盘约定：x 前正，z 右正。
         """
         x_mms = linear_x * 1000.0
-        z_dps = -math.degrees(angular_z)   # ROS 正=左转 -> 底盘 z 负=左转
-        return self.send_speed(x=round(x_mms), y=0, z=round(z_dps))
+        z_mrads = -angular_z * 1000.0      # ROS 正=左转 -> 底盘 z 负=左转
+        return self.send_speed(x=round(x_mms), y=0, z=round(z_mrads))
 
     def stop(self, repeat=3, interval=0.05):
         """连续发送几次零速指令，确保底盘停下。"""
@@ -160,7 +159,7 @@ class ChassisController:
     def read_status(self):
         """从串口缓存中解析一帧 24 字节状态，无完整有效帧返回 None。
 
-        返回字段：flag_stop, real_x/y/z(mm/s 或 度/s 折算), acc_x/y/z,
+        返回字段：flag_stop, real_x/y(mm/s)、real_z(rad/s)、acc_x/y/z,
                   ang_vel_x/y/z, battery_voltage(V)。
         """
         if not self.is_connected:
@@ -173,25 +172,30 @@ class ChassisController:
 
         s16 = self._s16
         u16 = self._u16
+        latest = None
         while len(self._rx) >= 24:
             start = self._rx.find(bytes([CMD_HEAD]))
             if start == -1:
                 self._rx.clear()
-                return None
+                break
             if start > 0:
                 del self._rx[:start]
             if len(self._rx) < 24:
-                return None
+                break
             frame = bytes(self._rx[:24])
-            del self._rx[:24]
             if frame[0] != CMD_HEAD or frame[23] != CMD_TAIL:
+                # 当前帧头不是状态帧（可能是噪声或指令回显），逐字节
+                # 重新同步，避免一次删掉24字节而跳过后面的有效帧。
+                del self._rx[0]
                 continue
             bcc = 0
             for i in range(22):
                 bcc ^= frame[i]
             if bcc != frame[22]:
+                del self._rx[0]
                 continue
-            return {
+            del self._rx[:24]
+            latest = {
                 'flag_stop': frame[1],
                 'real_x': s16(frame[2], frame[3]),
                 'real_y': s16(frame[4], frame[5]),
@@ -204,4 +208,6 @@ class ChassisController:
                 'ang_vel_z': s16(frame[18], frame[19]),
                 'battery_voltage': u16(frame[20], frame[21]) / 1000.0,
             }
-        return None
+        # 串口可能在两次调用之间积累很多状态帧。返回最新一帧，避免网页
+        # 和运行日志显示数秒以前的速度；末尾不完整帧仍保留到下次解析。
+        return latest

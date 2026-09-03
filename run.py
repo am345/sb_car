@@ -75,7 +75,7 @@ def main():
     parser.add_argument('--speed', type=int, default=160,
                         help='直道巡航速度 mm/s（底盘限幅 ±300）')
     parser.add_argument('--max-z', type=int, default=800,
-                        help='最大转向速度 度/s，默认 800')
+                        help='最大转向速度 mrad/s，默认 800（约45.8度/s）')
     parser.add_argument('--black', action='store_true', help='黑线白底（默认）')
     parser.add_argument('--white', action='store_true', help='白线黑底')
     parser.add_argument('--binary-mode', choices=('fixed', 'otsu', 'adaptive'),
@@ -95,7 +95,7 @@ def main():
     parser.add_argument('--err-alpha', type=float, default=0.6,
                         help='误差/角度低通滤波系数 0~1（默认0.6）')
     parser.add_argument('--z-rate', type=float, default=120.0,
-                        help='每帧最大转向增量 度/s（默认120，防猛甩）')
+                        help='每帧最大转向增量 mrad/s（默认120，防猛甩）')
     parser.add_argument('--lost-hold', type=int, default=10,
                         help='失线低速直行的帧数上限')
     parser.add_argument('--search-frames', type=int, default=15,
