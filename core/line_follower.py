@@ -152,6 +152,10 @@ class LineDetector:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
+        # L 弯不能由每行一个中心点的多项式可靠表达。先在完整连通域上
+        # 寻找“纵向主干 + 单侧长横臂”，把方向和拐点位置交给控制状态机。
+        corner = self._detect_l_corner(binary, roi_top)
+
         # --- 4. 扫描线 + 滑动搜索窗 ---
         # 预测位置作为搜索窗中心；丢线后重捕获时清空预测窗
         pred = self._prev_cx if self._prev_cx is not None else center
@@ -186,6 +190,7 @@ class LineDetector:
             'error_px': float(error_px),          # 线在右 → 正 → 右转
             'angle_deg': float(angle_deg),
             'fit_coeffs': (float(q2), float(q1), float(q0)),
+            **corner,
             'points': points,                   # 参与拟合的点
             'binary': binary,
             'roi_top': roi_top,
@@ -250,6 +255,60 @@ class LineDetector:
             cx = l0 + (best_s + best_e) // 2
             points.append((cx, rel_y + roi_top, bw))
         return points
+
+    def _detect_l_corner(self, binary, roi_top):
+        """检测单侧横臂的 L 弯；方向 -1=左，+1=右，0=未检测到。"""
+        roi_h, ww = binary.shape[:2]
+        empty = {
+            'corner_dir': 0,
+            'corner_point': None,
+            'corner_y_ratio': 0.0,
+            'corner_span': 0.0,
+        }
+        rows = []
+        for y in range(roi_h):
+            xs = np.flatnonzero(binary[y])
+            if xs.size >= self.min_seg_width:
+                rows.append((y, int(xs[0]), int(xs[-1]), int(xs.size)))
+        if len(rows) < 6:
+            return empty
+
+        # 横臂所在行的左右跨度会显著大于纵向胶带的正常宽度。
+        candidate = max(rows, key=lambda item: item[2] - item[1] + 1)
+        arm_y, arm_left, arm_right, _ = candidate
+        span = arm_right - arm_left + 1
+        lower = [item for item in rows
+                 if item[0] >= arm_y + max(3, int(round(roi_h * 0.04)))]
+        if len(lower) < 4:
+            return empty
+        normal_width = float(np.median([item[3] for item in lower]))
+        if span < max(ww * 0.12, normal_width * 1.6):
+            return empty
+
+        # 用横臂下方的主干中心确定拐点，避免把整条横臂的中点当作道路中心。
+        near_limit = arm_y + max(12, int(round(roi_h * 0.35)))
+        stem_rows = [item for item in lower if item[0] <= near_limit]
+        if len(stem_rows) < 4:
+            stem_rows = lower[:max(4, min(10, len(lower)))]
+        stem_x = float(np.median([(item[1] + item[2]) * 0.5
+                                  for item in stem_rows]))
+        left_extent = stem_x - arm_left
+        right_extent = arm_right - stem_x
+        margin = max(8.0, normal_width * 0.6)
+        min_arm = ww * 0.10
+        if right_extent >= min_arm and right_extent >= left_extent + margin:
+            direction = 1
+        elif left_extent >= min_arm and left_extent >= right_extent + margin:
+            direction = -1
+        else:
+            return empty                 # T/十字路口，不冒充 L 弯
+
+        return {
+            'corner_dir': direction,
+            'corner_point': (stem_x, float(arm_y + roi_top)),
+            'corner_y_ratio': float(arm_y / max(1, roi_h - 1)),
+            'corner_span': float(span),
+        }
 
     def _apply_global_threshold(self, blur, inside, threshold):
         """TODO-B2a：根据极性应用一个全局阈值，并保证窗外为 0。"""
@@ -327,7 +386,11 @@ class LineDetector:
             'centroid': None,
             'error_px': 0.0,
             'angle_deg': 0.0,
-            'a': 0.0, 'b': 0.0,
+            'fit_coeffs': None,
+            'corner_dir': 0,
+            'corner_point': None,
+            'corner_y_ratio': 0.0,
+            'corner_span': 0.0,
             'points': [],
             'binary': binary,
             'roi_top': roi_top,
@@ -406,6 +469,10 @@ class LineFollower:
         self._start_seen = 0      # 起步期连续有效帧计数
         self._started = False     # 起步确认是否完成(完成后才前进)
         self._run_frames = 0      # 起步后已运行帧数(速度斜坡用)
+        self._corner_dir = 0      # 正在执行的 L 弯方向：-1左，+1右
+        self._corner_frames = 0
+        self._corner_confirm_dir = 0
+        self._corner_confirm_count = 0
         self.fps = 0.0
         self._fps_n = 0
         self._fps_t = time.time()
@@ -444,7 +511,69 @@ class LineFollower:
                 angle = det['angle_deg']
                 p_term = d_term = angle_term = 0.0
 
-                if det['is_valid']:
+                observed_corner = int(det.get('corner_dir', 0))
+                corner_near = float(det.get('corner_y_ratio', 0.0)) >= 0.52
+                if (self._corner_dir == 0 and self._started and
+                        det['is_valid'] and observed_corner and corner_near):
+                    if observed_corner == self._corner_confirm_dir:
+                        self._corner_confirm_count += 1
+                    else:
+                        self._corner_confirm_dir = observed_corner
+                        self._corner_confirm_count = 1
+                    if self._corner_confirm_count >= 2:
+                        self._corner_dir = observed_corner
+                        self._corner_frames = 0
+                        logger.info('确认%s L 弯，进入原地转向',
+                                    '左' if observed_corner < 0 else '右')
+                elif self._corner_dir == 0:
+                    self._corner_confirm_dir = 0
+                    self._corner_confirm_count = 0
+
+                corner_handled = False
+                if self._corner_dir:
+                    # 至少旋转一段时间，避免仍看到旧主干时过早退出；出口线重新
+                    # 成为近似纵向且靠近中心后，才交还普通循迹控制。
+                    reacquired = (self._corner_frames >= 28 and det['is_valid'] and
+                                  observed_corner == 0 and abs(angle) < 35 and
+                                  abs(err) < 55)
+                    if reacquired:
+                        logger.info('%s L 弯出口已重新捕获',
+                                    '左' if self._corner_dir < 0 else '右')
+                        self._corner_dir = 0
+                        self._corner_frames = 0
+                        self._corner_confirm_dir = 0
+                        self._corner_confirm_count = 0
+                        self._has_prev = False
+                        self._last_z = 0.0
+                    else:
+                        self._corner_frames += 1
+                        self._lost_count = 0
+                        self._has_prev = False
+                        self._filtered_err = 0.0
+                        self._filtered_angle = 0.0
+                        turn_limit = min(abs(float(self.max_z)), 700.0)
+                        turn_mag = min(turn_limit,
+                                       160.0 + self._corner_frames * 45.0)
+                        raw_z = self._corner_dir * turn_mag
+                        self._last_sign = self._corner_dir
+                        self._last_z = raw_z
+                        z = -raw_z if self.z_invert else raw_z
+                        if self.base_speed <= 0 or self._corner_frames > 90:
+                            z = 0
+                        speed = 0
+                        state = ('corner-left' if self._corner_dir < 0
+                                 else 'corner-right')
+                        if self._corner_frames > 90:
+                            state = 'corner-stop'
+                        if self.chassis.send_speed(0, 0, int(z)):
+                            send_fail = 0
+                        else:
+                            send_fail += 1
+                        corner_handled = True
+
+                if corner_handled:
+                    pass
+                elif det['is_valid']:
                     state = 'run'
                     self._lost_count = 0
                     self._last_sign = 1 if err >= 0 else -1
@@ -526,6 +655,12 @@ class LineFollower:
                         speed = int(round(self.base_speed * ramp * curve_scale))
                         if abs(err) > 40:
                             speed = min(speed, int(round(self.base_speed * 0.3)))
+                        if observed_corner:
+                            # 拐点尚远时继续沿主干靠近，但预先减速；达到触发线后
+                            # 上面的确认逻辑会切换为原地转向。
+                            speed = min(speed, int(round(self.base_speed * 0.5)))
+                            state = ('corner-approach-left' if observed_corner < 0
+                                     else 'corner-approach-right')
                         if self.chassis.send_speed(speed, 0, int(z)):
                             send_fail = 0
                         else:

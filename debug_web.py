@@ -275,6 +275,8 @@ class DebugWebServer:
         status['valid'] = bool(det.get('is_valid', False))
         status['point_count'] = len(det.get('points') or [])
         status['polarity'] = det.get('line_type', '')
+        status['corner_dir'] = int(det.get('corner_dir', 0))
+        status['corner_y_ratio'] = float(det.get('corner_y_ratio', 0.0))
 
         jpeg = None
         now = time.monotonic()
@@ -450,6 +452,19 @@ class DebugWebServer:
                 curve[:, 1] = np.clip(curve[:, 1], 0, work_height - 1)
                 cv2.polylines(raw, [np.rint(curve).astype(np.int32)], False,
                               (0, 255, 255), 3, lineType=cv2.LINE_AA)
+        corner = det.get('corner_point')
+        corner_dir = int(det.get('corner_dir', 0))
+        if corner is not None and corner_dir:
+            corner_px = (int(round(corner[0] * scale)),
+                         int(round(corner[1] * scale)))
+            arrow_px = (corner_px[0] + corner_dir * 70, corner_px[1])
+            cv2.circle(raw, corner_px, 8, (0, 80, 255), 2,
+                       lineType=cv2.LINE_AA)
+            cv2.arrowedLine(raw, corner_px, arrow_px, (0, 80, 255), 3,
+                            line_type=cv2.LINE_AA, tipLength=0.25)
+            cv2.putText(raw, 'L-RIGHT' if corner_dir > 0 else 'L-LEFT',
+                        (max(5, corner_px[0] - 45), max(24, corner_px[1] - 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 80, 255), 2)
         cv2.putText(raw, 'RAW + FIT', (12, 26), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (0, 255, 255), 2)
 
