@@ -26,6 +26,7 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 
 import serial  # 用于捕获串口连接异常
@@ -56,6 +57,29 @@ def _load_web_config(logger):
         return {}
 
 
+def _set_manual_exposure(camera, exposure, logger):
+    """用 v4l2 锁定 UVC 摄像头曝光，避免遮挡时自动亮度跳变。"""
+    if not isinstance(camera.device, int):
+        logger.warning('当前视频源不是 V4L2 设备，跳过手动曝光')
+        return False
+    device_path = f'/dev/video{camera.device}'
+    command = [
+        'v4l2-ctl', '-d', device_path,
+        '-c', 'exposure_auto=1',
+        '-c', f'exposure_absolute={int(exposure)}',
+        '-c', 'exposure_auto_priority=0',
+    ]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True, timeout=3)
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        logger.warning('设置摄像头手动曝光失败: %s', exc)
+        return False
+    logger.info('摄像头手动曝光已锁定: device=%s exposure=%d',
+                device_path, exposure)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description='04-基于视觉的黑白线循迹')
     parser.add_argument('--camera', type=int, default=None,
@@ -72,6 +96,8 @@ def main():
                         help='调试网页端口（默认9090）')
     parser.add_argument('--web-fps', type=float, default=8.0,
                         help='网页图像刷新率上限（默认8 FPS）')
+    parser.add_argument('--exposure', type=int, default=150,
+                        help='摄像头手动曝光值（默认150）')
     parser.add_argument('--speed', type=int, default=160,
                         help='直道巡航速度 mm/s（底盘限幅 ±300）')
     parser.add_argument('--max-z', type=int, default=800,
@@ -158,6 +184,7 @@ def main():
         logger.error('无法打开 USB 摄像头(已尝试 0~3)，请检查连接')
         return
     logger.info('摄像头已打开: device=%s size=%s', camera.device, camera.actual_size)
+    _set_manual_exposure(camera, args.exposure, logger)
 
     # 2. 底盘串口
     ports = ChassisController.list_ports()
