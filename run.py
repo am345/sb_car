@@ -106,6 +106,8 @@ def main():
                         help='起步后速度从0平滑加速到目标的帧数(默认20，约1秒)')
     parser.add_argument('--corner-delay-frames', type=int, default=10,
                         help='确认L弯后继续低速直行的帧数（越大越晚转，默认10）')
+    parser.add_argument('--corner-delay-speed', type=int, default=40,
+                        help='确认L弯后延迟直行阶段的速度 mm/s（默认40）')
     parser.add_argument('--corner-turn-degrees', type=float, default=78.0,
                         help='L弯原地旋转的目标角度（度，默认78）')
     parser.add_argument('--start-rotate', action='store_true',
@@ -210,6 +212,7 @@ def main():
         startup_frames=args.startup_frames,
         ramp_frames=args.ramp_frames,
         corner_delay_frames=args.corner_delay_frames,
+        corner_delay_speed=args.corner_delay_speed,
         corner_turn_degrees=args.corner_turn_degrees,
         start_rotate=args.start_rotate,
         work_width=args.work_width,
