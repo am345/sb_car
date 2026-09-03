@@ -550,6 +550,8 @@ class LineFollower:
                 if self.web_debug is not None:
                     web_det = dict(det)
                     web_det['work_width'] = self.detector.work_width
+                    web_det['crop_top_frac'] = self.detector.crop_top_frac
+                    web_det['crop_bottom_frac'] = self.detector.crop_bottom_frac
                     self.web_debug.update(frame, web_det, {
                         'state': state,
                         'frame_count': frame_count,

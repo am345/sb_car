@@ -414,8 +414,28 @@ class DebugWebServer:
         detector_width = max(1, int(det.get('work_width', 320)))
         scale = work_width / detector_width
 
+        # 检测器使用的是以画面中心为轴、上宽下窄的梯形 ROI。
+        # 在原图和二值图上画出同一组边界，便于直接判断线路是否被裁掉。
+        roi_top = max(0, min(work_height - 1,
+                             int(round(det.get('roi_top', 0) * scale))))
+        top_frac = float(np.clip(det.get('crop_top_frac', 1.0), 0.0, 1.0))
+        bottom_frac = float(np.clip(det.get('crop_bottom_frac', 1.0), 0.0, 1.0))
+        center = work_width / 2.0
+        top_half = top_frac * work_width * 0.5
+        bottom_half = bottom_frac * work_width * 0.5
+        roi_outline = np.array([
+            [int(round(center - top_half)), roi_top],
+            [int(round(center + top_half)) - 1, roi_top],
+            [int(round(center + bottom_half)) - 1, work_height - 1],
+            [int(round(center - bottom_half)), work_height - 1],
+        ], dtype=np.int32)
+
         cv2.line(raw, (work_width // 2, 0), (work_width // 2, work_height),
                  (255, 100, 0), 1)
+        cv2.polylines(raw, [roi_outline], True, (255, 0, 255), 2,
+                      lineType=cv2.LINE_AA)
+        cv2.putText(raw, 'ROI', (roi_outline[0, 0] + 6, roi_top + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
         for x, y, width in det.get('points') or []:
             cv2.circle(raw, (int(x * scale), int(y * scale)), 4, (40, 240, 90), -1)
         if det.get('is_valid') and det.get('points'):
@@ -431,7 +451,6 @@ class DebugWebServer:
         binary_panel = np.full((work_height, work_width, 3), 255, np.uint8)
         binary = det.get('binary')
         if binary is not None and getattr(binary, 'size', 0):
-            roi_top = max(0, int(round(det.get('roi_top', 0) * scale)))
             available = max(1, work_height - roi_top)
             binary_view = cv2.resize(cv2.bitwise_not(binary),
                                      (work_width, available),
@@ -440,6 +459,8 @@ class DebugWebServer:
                 binary_view, cv2.COLOR_GRAY2BGR)
             cv2.line(binary_panel, (0, roi_top), (work_width, roi_top),
                      (0, 150, 255), 2)
+        cv2.polylines(binary_panel, [roi_outline], True, (255, 0, 255), 2,
+                      lineType=cv2.LINE_AA)
         cv2.putText(binary_panel, 'BINARY ROI', (12, 26), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (0, 80, 220), 2)
         return np.hstack((raw, binary_panel))
