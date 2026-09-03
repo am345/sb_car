@@ -579,17 +579,20 @@ class LineFollower:
                         self._has_prev = False
                         self._filtered_err = 0.0
                         self._filtered_angle = 0.0
-                        turn_limit = min(abs(float(self.max_z)), 420.0)
+                        turn_limit = min(abs(float(self.max_z)), 300.0)
                         turn_mag = min(turn_limit,
-                                       140.0 + self._corner_frames * 25.0)
+                                       100.0 + self._corner_frames * 15.0)
                         raw_z = self._corner_dir * turn_mag
-                        self._corner_turn_radians += abs(raw_z) * dt / 1000.0
                         self._last_sign = self._corner_dir
+                        turn_complete = (self._corner_turn_radians >= 1.35 or
+                                         self._corner_frames > 110)
+                        if turn_complete:
+                            raw_z = 0.0
+                        else:
+                            self._corner_turn_radians += abs(raw_z) * dt / 1000.0
                         self._last_z = raw_z
                         z = -raw_z if self.z_invert else raw_z
-                        turn_complete = (self._corner_turn_radians >= 1.35 or
-                                         self._corner_frames > 70)
-                        if self.base_speed <= 0 or turn_complete:
+                        if self.base_speed <= 0:
                             z = 0
                         speed = 0
                         state = ('corner-left' if self._corner_dir < 0
