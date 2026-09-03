@@ -413,6 +413,7 @@ class LineFollower:
       lost_hold   失线低速直行的帧数上限，超过则停车
       startup_frames 起步确认帧数：连续检测到线这么多帧后车辆才开始前进(默认5)
       ramp_frames    起步后速度从0平滑加速到目标的帧数(默认20，约1秒)
+      corner_delay_frames 确认L弯后低速直行多少帧再转向；越大转得越晚(默认10)
       start_rotate   起步确认期间是否原地转向对准线(默认False:静止确认后边前进边修正)
     """
 
@@ -421,7 +422,8 @@ class LineFollower:
                  kp=12.0, kd=1.2, ka=3.5,
                  err_alpha=0.6, z_rate_limit=120.0,
                  lost_hold=10, search_frames=15,
-                 startup_frames=5, ramp_frames=20, start_rotate=False,
+                 startup_frames=5, ramp_frames=20,
+                 corner_delay_frames=10, start_rotate=False,
                  work_width=320, roi_top_ratio=0.45,
                  n_scan_rows=12, scan_start_ratio=0.25,
                  crop_bottom_frac=0.50, crop_top_frac=0.60,
@@ -444,6 +446,7 @@ class LineFollower:
         self.z_invert = z_invert            # 转向方向取反(硬件/装向与协议约定相反时使用)
         self.startup_frames = startup_frames  # 起步确认帧数：线连续稳定这么多帧后才前进
         self.ramp_frames = ramp_frames        # 起步后速度从0平滑加速到目标所用帧数
+        self.corner_delay_frames = max(0, int(corner_delay_frames))
         self.start_rotate = start_rotate      # 起步是否原地转向对准线(默认关，静止确认后前进)
 
         self.detector = LineDetector(
@@ -535,26 +538,27 @@ class LineFollower:
 
                 corner_handled = False
                 if self._corner_dir:
-                    # 识别到 L 后不立刻转：先以低速直行约 0.5 秒，让车身中心
-                    # 真正到达拐点，再进入有界的原地转向。
+                    # 识别到 L 后不立刻转：按可调帧数低速直行，让车身中心
+                    # 到达拐点后再进入有界的原地转向。
                     if self._corner_phase == 'advance':
-                        self._corner_frames += 1
-                        z = 0
-                        speed = min(70, max(0, int(round(self.base_speed * 0.25))))
-                        state = ('corner-delay-left' if self._corner_dir < 0
-                                 else 'corner-delay-right')
-                        if self.base_speed <= 0:
-                            speed = 0
-                        if self.chassis.send_speed(speed, 0, 0):
-                            send_fail = 0
-                        else:
-                            send_fail += 1
-                        if self._corner_frames >= 10:
+                        if self._corner_frames >= self.corner_delay_frames:
                             self._corner_phase = 'turn'
                             self._corner_frames = 0
                             logger.info('%s L 弯已到近处，开始受限原地转向',
                                         '左' if self._corner_dir < 0 else '右')
-                        corner_handled = True
+                        else:
+                            self._corner_frames += 1
+                            z = 0
+                            speed = min(70, max(0, int(round(self.base_speed * 0.25))))
+                            state = ('corner-delay-left' if self._corner_dir < 0
+                                     else 'corner-delay-right')
+                            if self.base_speed <= 0:
+                                speed = 0
+                            if self.chassis.send_speed(speed, 0, 0):
+                                send_fail = 0
+                            else:
+                                send_fail += 1
+                            corner_handled = True
 
                     # 出口线转成近似纵向后即可结束，不再强制长时间旋转。
                     reacquired = (self._corner_phase == 'turn' and
@@ -739,6 +743,7 @@ class LineFollower:
                         'started': self._started,
                         'binary_mode': self.detector.binary_mode,
                         'corner_phase': self._corner_phase,
+                        'corner_delay_frames': self.corner_delay_frames,
                         'corner_turn_deg': math.degrees(self._corner_turn_radians),
                     })
                     if self.web_debug.restart_requested:
