@@ -471,6 +471,8 @@ class LineFollower:
         self._run_frames = 0      # 起步后已运行帧数(速度斜坡用)
         self._corner_dir = 0      # 正在执行的 L 弯方向：-1左，+1右
         self._corner_frames = 0
+        self._corner_phase = ''   # advance: 越过拐点；turn: 原地转向
+        self._corner_turn_radians = 0.0
         self._corner_confirm_dir = 0
         self._corner_confirm_count = 0
         self.fps = 0.0
@@ -523,7 +525,9 @@ class LineFollower:
                     if self._corner_confirm_count >= 2:
                         self._corner_dir = observed_corner
                         self._corner_frames = 0
-                        logger.info('确认%s L 弯，进入原地转向',
+                        self._corner_phase = 'advance'
+                        self._corner_turn_radians = 0.0
+                        logger.info('确认%s L 弯，先低速直行越过拐点',
                                     '左' if observed_corner < 0 else '右')
                 elif self._corner_dir == 0:
                     self._corner_confirm_dir = 0
@@ -531,39 +535,66 @@ class LineFollower:
 
                 corner_handled = False
                 if self._corner_dir:
-                    # 至少旋转一段时间，避免仍看到旧主干时过早退出；出口线重新
-                    # 成为近似纵向且靠近中心后，才交还普通循迹控制。
-                    reacquired = (self._corner_frames >= 28 and det['is_valid'] and
+                    # 识别到 L 后不立刻转：先以低速直行约 0.5 秒，让车身中心
+                    # 真正到达拐点，再进入有界的原地转向。
+                    if self._corner_phase == 'advance':
+                        self._corner_frames += 1
+                        z = 0
+                        speed = min(70, max(0, int(round(self.base_speed * 0.25))))
+                        state = ('corner-delay-left' if self._corner_dir < 0
+                                 else 'corner-delay-right')
+                        if self.base_speed <= 0:
+                            speed = 0
+                        if self.chassis.send_speed(speed, 0, 0):
+                            send_fail = 0
+                        else:
+                            send_fail += 1
+                        if self._corner_frames >= 10:
+                            self._corner_phase = 'turn'
+                            self._corner_frames = 0
+                            logger.info('%s L 弯已到近处，开始受限原地转向',
+                                        '左' if self._corner_dir < 0 else '右')
+                        corner_handled = True
+
+                    # 出口线转成近似纵向后即可结束，不再强制长时间旋转。
+                    reacquired = (self._corner_phase == 'turn' and
+                                  self._corner_turn_radians >= 0.75 and
+                                  det['is_valid'] and
                                   observed_corner == 0 and abs(angle) < 35 and
                                   abs(err) < 55)
-                    if reacquired:
+                    if not corner_handled and reacquired:
                         logger.info('%s L 弯出口已重新捕获',
                                     '左' if self._corner_dir < 0 else '右')
                         self._corner_dir = 0
                         self._corner_frames = 0
+                        self._corner_phase = ''
+                        self._corner_turn_radians = 0.0
                         self._corner_confirm_dir = 0
                         self._corner_confirm_count = 0
                         self._has_prev = False
                         self._last_z = 0.0
-                    else:
+                    elif not corner_handled:
                         self._corner_frames += 1
                         self._lost_count = 0
                         self._has_prev = False
                         self._filtered_err = 0.0
                         self._filtered_angle = 0.0
-                        turn_limit = min(abs(float(self.max_z)), 700.0)
+                        turn_limit = min(abs(float(self.max_z)), 420.0)
                         turn_mag = min(turn_limit,
-                                       160.0 + self._corner_frames * 45.0)
+                                       140.0 + self._corner_frames * 25.0)
                         raw_z = self._corner_dir * turn_mag
+                        self._corner_turn_radians += abs(raw_z) * dt / 1000.0
                         self._last_sign = self._corner_dir
                         self._last_z = raw_z
                         z = -raw_z if self.z_invert else raw_z
-                        if self.base_speed <= 0 or self._corner_frames > 90:
+                        turn_complete = (self._corner_turn_radians >= 1.35 or
+                                         self._corner_frames > 70)
+                        if self.base_speed <= 0 or turn_complete:
                             z = 0
                         speed = 0
                         state = ('corner-left' if self._corner_dir < 0
                                  else 'corner-right')
-                        if self._corner_frames > 90:
+                        if turn_complete:
                             state = 'corner-stop'
                         if self.chassis.send_speed(0, 0, int(z)):
                             send_fail = 0
@@ -658,7 +689,9 @@ class LineFollower:
                         if observed_corner:
                             # 拐点尚远时继续沿主干靠近，但预先减速；达到触发线后
                             # 上面的确认逻辑会切换为原地转向。
-                            speed = min(speed, int(round(self.base_speed * 0.5)))
+                            speed = min(speed, int(round(self.base_speed * 0.35)))
+                            z = 0
+                            self._last_z = 0.0
                             state = ('corner-approach-left' if observed_corner < 0
                                      else 'corner-approach-right')
                         if self.chassis.send_speed(speed, 0, int(z)):
@@ -702,6 +735,8 @@ class LineFollower:
                         'startup_frames': self.startup_frames,
                         'started': self._started,
                         'binary_mode': self.detector.binary_mode,
+                        'corner_phase': self._corner_phase,
+                        'corner_turn_deg': math.degrees(self._corner_turn_radians),
                     })
                     if self.web_debug.restart_requested:
                         logger.info('收到网页参数更新，停车后重启')
