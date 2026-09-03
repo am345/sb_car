@@ -96,8 +96,6 @@ def main():
                         help='误差/角度低通滤波系数 0~1（默认0.6）')
     parser.add_argument('--z-rate', type=float, default=120.0,
                         help='每帧最大转向增量 度/s（默认120，防猛甩）')
-    parser.add_argument('--turn-delay-frames', type=int, default=4,
-                        help='明显转向/换向连续确认帧数（0=不延迟，默认4）')
     parser.add_argument('--lost-hold', type=int, default=10,
                         help='失线低速直行的帧数上限')
     parser.add_argument('--search-frames', type=int, default=15,
@@ -120,10 +118,6 @@ def main():
                         help='远处裁剪宽度比例(0~1，越大越宽=转弯余量，默认0.60)')
     parser.add_argument('--track-half', type=float, default=60.0,
                         help='滑动搜索窗半宽 px（默认60，越大越不易丢线但抗干扰弱）')
-    parser.add_argument('--line-min-width', type=int, default=12,
-                        help='有效黑线最小宽度（工作图像像素，默认12）')
-    parser.add_argument('--line-max-width', type=int, default=60,
-                        help='有效黑线最大宽度（工作图像像素，默认60）')
     parser.add_argument('--work-width', type=int, default=320,
                         help='处理分辨率宽度(默认320)')
     parser.add_argument('--max-frames', type=int, default=None,
@@ -207,7 +201,6 @@ def main():
         kp=args.kp, kd=args.kd, ka=args.ka,
         err_alpha=args.err_alpha,
         z_rate_limit=args.z_rate,
-        turn_delay_frames=args.turn_delay_frames,
         lost_hold=args.lost_hold,
         search_frames=args.search_frames,
         startup_frames=args.startup_frames,
@@ -220,8 +213,6 @@ def main():
         crop_bottom_frac=args.crop_bottom,
         crop_top_frac=args.crop_top,
         track_half=args.track_half,
-        line_min_width=args.line_min_width,
-        line_max_width=args.line_max_width,
         polarity=polarity,
         binary_mode=args.binary_mode,
         fixed_threshold=args.threshold,

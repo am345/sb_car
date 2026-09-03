@@ -34,7 +34,7 @@ class LineDetector:
     """从画面中提取巡线路径中心与方向（处理在降采样小图上进行）。"""
 
     def __init__(self, work_width=320, roi_top_ratio=0.45,
-                 n_scan_rows=12, min_seg_width=12, max_seg_width=60,
+                 n_scan_rows=12, min_seg_width=2,
                  polarity='black',
                  crop_bottom_frac=0.25, crop_top_frac=0.60,
                  track_half=50.0, scan_start_ratio=0.25,
@@ -44,7 +44,6 @@ class LineDetector:
         self.roi_top_ratio = roi_top_ratio          # 垂直方向：只处理底部这段(车前方地面)
         self.n_scan_rows = n_scan_rows              # 扫描行数
         self.min_seg_width = min_seg_width          # 过滤过窄噪点段
-        self.max_seg_width = max_seg_width          # 过滤阴影/大黑块等过宽区域
         self.polarity = polarity                    # 'black'=黑线白底 / 'white'=白线黑底
         # 梯形裁切：底部保留比例 / 顶部保留比例（相对整幅宽）
         self.crop_bottom_frac = crop_bottom_frac    # 底部(近车头)窗口窄
@@ -97,15 +96,6 @@ class LineDetector:
         columns = np.arange(ww, dtype=np.float64)[None, :]
         inside = ((columns >= (center - half_widths)[:, None]) &
                   (columns < (center + half_widths)[:, None]))
-        if self._prev_cx is not None:
-            # 弯道中线路可能很快跑出固定梯形。沿上一帧中心附加
-            # 一条动态竖向走廊；预测窗仍负责抗干扰，而全窗重捕可在
-            # 延迟转向后把快速横移的线找回来。
-            tracking_margin = max(self.track_half * 1.5, ww * 0.12)
-            tracking_corridor = (
-                (columns >= self._prev_cx - tracking_margin) &
-                (columns <= self._prev_cx + tracking_margin))
-            inside |= tracking_corridor
 
         # TODO-B2【二值化】
         # fixed：使用 fixed_threshold；otsu：调用学生手写的 _otsu；
@@ -128,10 +118,9 @@ class LineDetector:
                 return self._empty_result(binary=None, roi_top=roi_top)
             binary = self._apply_global_threshold(blur, inside, threshold)
 
-        # 前景占比只做退化画面保护。室内阴影可能占据较大面积，不能在
-        # 连通域几何过滤前直接判整帧无效，否则阴影旁的真实黑线也会丢失。
+        # 前景占比校验：一条线只应占窗内很小比例，占满整窗说明是假检(纯色/大面积暗区)
         fg_ratio = binary[inside].mean() / 255.0
-        if fg_ratio < 0.005 or fg_ratio > 0.90:
+        if fg_ratio < 0.005 or fg_ratio > 0.35:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
@@ -145,7 +134,7 @@ class LineDetector:
         # 用 高度占比 + 面积/包围盒 挤出比例 来判断，曲线弯(横向但有长度)也能保留。
         _, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
         line_mask = np.zeros_like(binary)
-        min_h = roi_h * 0.18          # 急弯可见纵向高度较短，仍保留横块过滤
+        min_h = roi_h * 0.25          # 线至少要覆盖 ROI 25% 的高度(曲线弯放宽)
         for i in range(1, labels.max() + 1):
             x_, y_, bw_, bh_, area = stats[i]
             if area < 25:
@@ -157,11 +146,6 @@ class LineDetector:
             fill = area / float(bw_ * bh_)          # 0~1，实心色块接近1
             if bw_ > 8 and bh_ > 8 and fill > 0.85:
                 continue                            # 实心大色块→剔除(防假检)
-            # area / height 是该组件每一行的平均宽度。大片阴影即使边缘
-            # 不规则、fill 较低，平均行宽仍明显大于目标黑线。
-            mean_row_width = area / float(bh_)
-            if mean_row_width > self.max_seg_width:
-                continue
             line_mask[labels == i] = 255
         binary = line_mask
         if int(binary.max()) == 0:
@@ -258,15 +242,13 @@ class LineDetector:
                 while i < seg.size and seg[i] != 0:
                     i += 1
                 end = i
-                width = end - start
-                if (self.min_seg_width <= width <= self.max_seg_width and
-                        (best_s < 0 or width > best_e - best_s)):
+                if best_s < 0 or end - start > best_e - best_s:
                     best_s, best_e = start, end
 
             if best_s < 0:
                 continue
             bw = best_e - best_s
-            if not self.min_seg_width <= bw <= self.max_seg_width:
+            if bw < self.min_seg_width:
                 continue
             cx = l0 + (best_s + best_e) // 2
             points.append((cx, rel_y + roi_top, bw))
@@ -377,14 +359,13 @@ class LineFollower:
     def __init__(self, camera, chassis,
                  base_speed=160, max_z=800,
                  kp=12.0, kd=1.2, ka=3.5,
-                 err_alpha=0.6, z_rate_limit=120.0, turn_delay_frames=4,
+                 err_alpha=0.6, z_rate_limit=120.0,
                  lost_hold=10, search_frames=15,
                  startup_frames=5, ramp_frames=20, start_rotate=False,
                  work_width=320, roi_top_ratio=0.45,
                  n_scan_rows=12, scan_start_ratio=0.25,
                  crop_bottom_frac=0.50, crop_top_frac=0.60,
-                 track_half=60.0, line_min_width=12, line_max_width=60,
-                 polarity='black',
+                 track_half=60.0, polarity='black',
                  binary_mode='otsu', fixed_threshold=100,
                  adaptive_block=31, adaptive_c=8.0,
                  z_invert=True,   # 转向方向取反（默认 True）
@@ -398,9 +379,6 @@ class LineFollower:
         self.ka = ka
         self.err_alpha = err_alpha
         self.z_rate_limit = z_rate_limit    # 每帧最大转向增量(°/s)，防猛甩
-        self.turn_delay_frames = max(0, int(turn_delay_frames))
-        # 只对明显转弯的“新方向”做延迟，小幅回正不延迟。
-        self.turn_delay_threshold = max(60.0, min(160.0, abs(max_z) * 0.18))
         self.lost_hold = lost_hold
         self.search_frames = search_frames  # 失线后低速旋转搜索的帧数
         self.z_invert = z_invert            # 转向方向取反(硬件/装向与协议约定相反时使用)
@@ -412,8 +390,7 @@ class LineFollower:
             work_width=work_width, roi_top_ratio=roi_top_ratio,
             n_scan_rows=n_scan_rows, scan_start_ratio=scan_start_ratio,
             crop_bottom_frac=crop_bottom_frac, crop_top_frac=crop_top_frac,
-            track_half=track_half, min_seg_width=line_min_width,
-            max_seg_width=line_max_width, polarity=polarity,
+            track_half=track_half, polarity=polarity,
             binary_mode=binary_mode, fixed_threshold=fixed_threshold,
             adaptive_block=adaptive_block, adaptive_c=adaptive_c)
         self.target_fps = target_fps
@@ -432,9 +409,6 @@ class LineFollower:
         self._start_seen = 0      # 起步期连续有效帧计数
         self._started = False     # 起步确认是否完成(完成后才前进)
         self._run_frames = 0      # 起步后已运行帧数(速度斜坡用)
-        self._active_turn_sign = 0
-        self._pending_turn_sign = 0
-        self._pending_turn_count = 0
         self.fps = 0.0
         self._fps_n = 0
         self._fps_t = time.time()
@@ -472,7 +446,6 @@ class LineFollower:
                 err = det['error_px']
                 angle = det['angle_deg']
                 p_term = d_term = angle_term = 0.0
-                turn_waiting = False
 
                 if det['is_valid']:
                     state = 'run'
@@ -504,41 +477,8 @@ class LineFollower:
                     d_term = self.kd * derr
                     angle_term = self.ka * angle
                     z_raw = p_term + d_term + angle_term
-                    z_target = float(np.clip(
+                    z = float(np.clip(
                         z_raw, -abs(self.max_z), abs(self.max_z)))
-
-                    # 转向触发延迟：大转向或 S 弯换向时，新方向必须
-                    # 稳定持续 turn_delay_frames 帧才生效。当需求回到小幅时
-                    # 立即退出弯道状态，不把出弯回正也一起延迟。
-                    demand_sign = (1 if z_target > 0 else -1
-                                   if z_target < 0 else 0)
-                    is_clear_turn = abs(z_target) >= self.turn_delay_threshold
-                    if self.turn_delay_frames <= 0 or not is_clear_turn:
-                        z = z_target
-                        if not is_clear_turn:
-                            self._active_turn_sign = 0
-                            self._pending_turn_sign = 0
-                            self._pending_turn_count = 0
-                    elif demand_sign == self._active_turn_sign:
-                        z = z_target
-                        self._pending_turn_sign = 0
-                        self._pending_turn_count = 0
-                    else:
-                        if demand_sign == self._pending_turn_sign:
-                            self._pending_turn_count += 1
-                        else:
-                            self._pending_turn_sign = demand_sign
-                            self._pending_turn_count = 1
-                            # S 弯换向时先立即撤掉旧方向，不继续打反向。
-                            self._last_z = 0.0
-                        if self._pending_turn_count >= self.turn_delay_frames:
-                            self._active_turn_sign = demand_sign
-                            self._pending_turn_sign = 0
-                            self._pending_turn_count = 0
-                            z = z_target
-                        else:
-                            z = 0.0
-                            turn_waiting = True
 
                     # 转向速率限制：单帧最多变化 z_rate_limit °/s，防车身猛甩
                     dz = z - self._last_z
@@ -584,12 +524,8 @@ class LineFollower:
                         else:
                             ramp = min(1.0, self._run_frames / self.ramp_frames)
                         max_turn = max(1.0, abs(float(self.max_z)))
-                        # 用“当前检测到的转向需求”降速，而不是延迟后的
-                        # z。因此即使还在 turn-delay，车也会先慢下来。
-                        turn_ratio = min(1.0, abs(z_target) / max_turn)
+                        turn_ratio = min(1.0, abs(z) / max_turn)
                         curve_scale = max(0.3, 1.0 - 0.7 * turn_ratio)
-                        if turn_waiting:
-                            curve_scale = min(curve_scale, 0.5)
                         speed = int(round(self.base_speed * ramp * curve_scale))
                         if abs(err) > 40:
                             speed = min(speed, int(round(self.base_speed * 0.3)))
@@ -598,16 +534,11 @@ class LineFollower:
                         else:
                             send_fail += 1
                         self._prev_err = err
-                        if turn_waiting:
-                            state = 'turn-delay'
                 else:
                     self._has_prev = False
                     self._filtered_err = 0.0
                     self._filtered_angle = 0.0
                     self._last_z = 0.0
-                    self._active_turn_sign = 0
-                    self._pending_turn_sign = 0
-                    self._pending_turn_count = 0
                     if not self._started:
                         # 起步期间失线：不前进也不旋转搜索，原地停车等线出现
                         self._start_seen = 0
@@ -619,7 +550,6 @@ class LineFollower:
                 if self.web_debug is not None:
                     web_det = dict(det)
                     web_det['work_width'] = self.detector.work_width
-                    point_widths = [point[2] for point in det.get('points', [])]
                     self.web_debug.update(frame, web_det, {
                         'state': state,
                         'frame_count': frame_count,
@@ -638,11 +568,6 @@ class LineFollower:
                         'startup_frames': self.startup_frames,
                         'started': self._started,
                         'binary_mode': self.detector.binary_mode,
-                        'turn_delay_frames': self.turn_delay_frames,
-                        'turn_delay_count': self._pending_turn_count,
-                        'line_width_min': min(point_widths) if point_widths else None,
-                        'line_width_avg': (sum(point_widths) / len(point_widths)) if point_widths else None,
-                        'line_width_max': max(point_widths) if point_widths else None,
                     })
                     if self.web_debug.restart_requested:
                         logger.info('收到网页参数更新，停车后重启')

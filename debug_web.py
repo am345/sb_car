@@ -26,14 +26,11 @@ CONFIG_SCHEMA = {
     'ka': (float, 0.0, 20.0),
     'err_alpha': (float, 0.01, 1.0),
     'z_rate': (float, 1.0, 500.0),
-    'turn_delay_frames': (int, 0, 30),
     'roi_top': (float, 0.0, 0.9),
     'scan_start': (float, 0.0, 0.9),
     'crop_bottom': (float, 0.1, 1.0),
     'crop_top': (float, 0.1, 1.0),
     'track_half': (float, 5.0, 160.0),
-    'line_min_width': (int, 1, 100),
-    'line_max_width': (int, 2, 200),
     'startup_frames': (int, 1, 100),
     'ramp_frames': (int, 0, 200),
     'lost_hold': (int, 0, 100),
@@ -120,7 +117,6 @@ _DASHBOARD_HTML = r"""<!doctype html>
         <div><div class="bar-label"><span>起步确认</span><span id="startCount">--</span></div><div class="track"><div id="startBar" class="fill"></div></div></div>
         <div class="metric"><div class="label">检测点 / 失线 / 相机无帧</div><div id="counts" class="value small">--</div></div>
         <div class="metric"><div class="label">P / D / 角度前馈</div><div id="terms" class="value small">--</div></div>
-        <div class="metric"><div class="label">线宽 min / avg / max</div><div id="lineWidth" class="value small">--</div></div>
         <div class="metric"><div class="label">二值化 / 线极性</div><div id="mode" class="value small">--</div></div>
       </div>
     </aside>
@@ -140,11 +136,9 @@ const fields=[
  ['speed','巡航速度 mm/s','number','1'],['max_z','最大转向 °/s','number','1'],
  ['kp','P 增益','number','0.1'],['kd','D 增益','number','0.1'],['ka','角度前馈','number','0.1'],
  ['err_alpha','滤波系数','number','0.05'],['z_rate','转向变化限制','number','1'],
- ['turn_delay_frames','转向延迟帧','number','1'],
  ['roi_top','ROI 起点','number','0.05'],['scan_start','扫描起点','number','0.05'],
  ['crop_bottom','近处宽度比','number','0.05'],['crop_top','远处宽度比','number','0.05'],
- ['track_half','搜索窗半宽 px','number','1'],['line_min_width','最小线宽 px','number','1'],
- ['line_max_width','最大线宽 px','number','1'],['startup_frames','起步确认帧','number','1'],
+ ['track_half','搜索窗半宽 px','number','1'],['startup_frames','起步确认帧','number','1'],
  ['ramp_frames','加速斜坡帧','number','1'],['lost_hold','失线保持帧','number','1'],
  ['search_frames','失线搜索帧','number','1'],['threshold','固定阈值','number','1'],
  ['adaptive_block','自适应邻域','number','2'],['adaptive_c','自适应 C','number','0.5'],
@@ -180,7 +174,6 @@ async function refresh(){
     $('startBar').style.width=sp+'%'; $('startCount').textContent=d.started?'已起步':`${d.start_seen||0}/${d.startup_frames||0}`;
     $('counts').textContent=`${d.point_count||0} / ${d.lost_count||0} / ${d.no_frame_count||0}`;
     $('terms').textContent=`${num(d.p_term)} / ${num(d.d_term)} / ${num(d.angle_term)}`;
-    $('lineWidth').textContent=d.line_width_avg==null?'--':`${num(d.line_width_min,0)} / ${num(d.line_width_avg)} / ${num(d.line_width_max,0)} px`;
     $('mode').textContent=`${d.binary_mode||'--'} / ${d.polarity||'--'}`;
   } catch(e) { $('connection').textContent='连接中断'; $('connection').className='bad'; }
 }
@@ -314,8 +307,6 @@ class DebugWebServer:
             clean['adaptive_block'] += 1
         if clean['adaptive_block'] > CONFIG_SCHEMA['adaptive_block'][2]:
             clean['adaptive_block'] -= 2
-        if clean['line_min_width'] > clean['line_max_width']:
-            raise ValueError('最小线宽不能大于最大线宽')
 
         if not self.config_path:
             raise ValueError('服务端未配置参数文件')
