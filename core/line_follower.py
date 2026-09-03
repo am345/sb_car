@@ -167,6 +167,16 @@ class LineDetector:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
+        if corner.get('junction_straight'):
+            # 交叉点的横臂会成为扫描行里的最长黑段并把拟合中心拉向支路。
+            # 只保留贴近贯穿主干的点，让车辆沿进入路口时的主线直行。
+            stem_x = float(corner['junction_stem_x'])
+            stem_tol = max(14.0, float(corner['junction_normal_width']) * 1.5)
+            stem_points = [point for point in points
+                           if abs(float(point[0]) - stem_x) <= stem_tol]
+            if len(stem_points) >= 3:
+                points = stem_points
+
         # 道路线必须延伸到近车头区域。只在 ROI 中上部出现的细长物体
         # （例如电线）即使能提供多个扫描点，也不能向底部外推成道路。
         near_y = roi_top + int(roi_h * 0.80)
@@ -276,6 +286,9 @@ class LineDetector:
             'corner_point': None,
             'corner_y_ratio': 0.0,
             'corner_span': 0.0,
+            'junction_straight': False,
+            'junction_stem_x': 0.0,
+            'junction_normal_width': 0.0,
         }
         rows = []
         for y in range(roi_h):
@@ -317,6 +330,31 @@ class LineDetector:
             stem_rows = lower[:max(4, min(10, len(lower)))]
         stem_x = float(np.median([(item[1] + item[2]) * 0.5
                                   for item in stem_rows]))
+
+        # 真 L 在横臂之后不会继续保持原来的纵向主干；交叉路口则有一条
+        # 与下方主干对齐的线穿过横臂。反光可能抹掉一侧横臂，因此这里
+        # 直接检查“上方是否仍有贯穿主干”，不依赖左右横臂是否对称。
+        upper_gap = max(6, int(round(roi_h * 0.05)))
+        required_upper = max(5, int(round(roi_h * 0.08)))
+        align_tol = max(8.0, normal_width * 1.2)
+        upper_stem_rows = [item for item in rows
+                           if item[0] <= arm_y - upper_gap and
+                           item[1] - align_tol <= stem_x <= item[2] + align_tol]
+        upper_continues = (len(upper_stem_rows) >= required_upper and
+                           upper_stem_rows[-1][0] - upper_stem_rows[0][0]
+                           >= required_upper - 1)
+        if upper_continues:
+            result = dict(empty)
+            result.update({
+                'corner_point': (stem_x, float(arm_y + roi_top)),
+                'corner_y_ratio': float(arm_y / max(1, roi_h - 1)),
+                'corner_span': float(span),
+                'junction_straight': True,
+                'junction_stem_x': stem_x,
+                'junction_normal_width': normal_width,
+            })
+            return result
+
         left_extent = stem_x - arm_left
         right_extent = arm_right - stem_x
         margin = max(8.0, normal_width * 0.6)
@@ -339,6 +377,9 @@ class LineDetector:
             'corner_point': (stem_x, float(arm_y + roi_top)),
             'corner_y_ratio': float(arm_y / max(1, roi_h - 1)),
             'corner_span': float(span),
+            'junction_straight': False,
+            'junction_stem_x': 0.0,
+            'junction_normal_width': 0.0,
         }
 
     def _apply_global_threshold(self, blur, inside, threshold):
@@ -422,6 +463,9 @@ class LineDetector:
             'corner_point': None,
             'corner_y_ratio': 0.0,
             'corner_span': 0.0,
+            'junction_straight': False,
+            'junction_stem_x': 0.0,
+            'junction_normal_width': 0.0,
             'points': [],
             'binary': binary,
             'roi_top': roi_top,

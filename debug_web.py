@@ -286,6 +286,7 @@ class DebugWebServer:
         status['corner_dir'] = int(det.get('corner_dir', 0))
         status['corner_y_ratio'] = float(det.get('corner_y_ratio', 0.0))
         status['corner_span'] = float(det.get('corner_span', 0.0))
+        status['junction_straight'] = bool(det.get('junction_straight', False))
 
         jpeg = None
         now = time.monotonic()
@@ -463,6 +464,14 @@ class DebugWebServer:
                               (0, 255, 255), 3, lineType=cv2.LINE_AA)
         corner = det.get('corner_point')
         corner_dir = int(det.get('corner_dir', 0))
+        if corner is not None and det.get('junction_straight'):
+            junction_px = (int(round(corner[0] * scale)),
+                           int(round(corner[1] * scale)))
+            cv2.circle(raw, junction_px, 9, (255, 255, 0), 2,
+                       lineType=cv2.LINE_AA)
+            cv2.putText(raw, 'CROSS-STRAIGHT',
+                        (max(5, junction_px[0] - 75), max(24, junction_px[1] - 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
         if corner is not None and corner_dir:
             corner_px = (int(round(corner[0] * scale)),
                          int(round(corner[1] * scale)))
