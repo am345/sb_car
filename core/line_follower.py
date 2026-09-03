@@ -321,6 +321,12 @@ class LineDetector:
         right_extent = arm_right - stem_x
         margin = max(8.0, normal_width * 0.6)
         min_arm = ww * 0.10
+
+        # 十字/T 路口即使受透视或 ROI 裁切影响，两侧横臂也可能明显不等长。
+        # 只要主干左右都存在足够长的横臂，就优先归为交叉口，绝不能按
+        # “较长的一边”冒充 L 弯。
+        if left_extent >= min_arm and right_extent >= min_arm:
+            return empty
         if right_extent >= min_arm and right_extent >= left_extent + margin:
             direction = 1
         elif left_extent >= min_arm and left_extent >= right_extent + margin:
