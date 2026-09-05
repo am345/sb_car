@@ -379,14 +379,72 @@ class LineDetector:
         if len(lower) < 4:
             return empty
         normal_width = float(np.median([item[3] for item in lower]))
-        if span < max(ww * 0.16, normal_width * 2.0):
+        # 普通圆弧在切线接近水平时也会产生一行较宽的黑带。
+        # 真 L 的横臂相对线宽应该明显更长，先用长宽比排除这种
+        # “渐进变宽”的弯道。
+        if span < max(ww * 0.18, normal_width * 3.8):
             return empty
 
-        # 用横臂下方的主干中心确定拐点，避免把整条横臂的中点当作道路中心。
-        near_limit = arm_y + max(12, int(round(roi_h * 0.35)))
-        stem_rows = [item for item in lower if item[0] <= near_limit]
-        if len(stem_rows) < 4:
-            stem_rows = lower[:max(4, min(10, len(lower)))]
+        # 找到横臂向下收窄成正常线宽后的进入段。真 L 在这里应该是
+        # 一段近似直线；圆弧的中心会持续横向滑动，不能当成 L 主干。
+        narrow_rows = [item for item in rows
+                       if item[0] > arm_y and
+                       item[3] <= normal_width * 1.6]
+        if not narrow_rows:
+            return empty
+        stem_start_y = narrow_rows[0][0]
+        stem_end_y = stem_start_y + max(10, int(round(roi_h * 0.20)))
+        stem_rows = [item for item in rows
+                     if stem_start_y <= item[0] <= stem_end_y and
+                     item[3] <= normal_width * 1.8]
+        if len(stem_rows) < 6:
+            return empty
+        stem_ys = np.asarray([item[0] for item in stem_rows], dtype=np.float64)
+        stem_centers = np.asarray([(item[1] + item[2]) * 0.5
+                                   for item in stem_rows], dtype=np.float64)
+
+        # 反光会在黑胶带中间切出白缝，“最长黑段”的中心会在左右
+        # 半边之间跳动。用小规模 RANSAC 找多数一致的主干，不让少数
+        # 裂线点把整个真 L 否决掉。
+        inlier_tol = max(2.0, normal_width * 0.25)
+        best_inliers = None
+        best_error = float('inf')
+        for i, j in combinations(range(len(stem_rows)), 2):
+            dy = stem_ys[j] - stem_ys[i]
+            if abs(dy) < 1e-6:
+                continue
+            slope = (stem_centers[j] - stem_centers[i]) / dy
+            intercept = stem_centers[i] - slope * stem_ys[i]
+            residual = np.abs(stem_centers -
+                              (slope * stem_ys + intercept))
+            inliers = residual <= inlier_tol
+            count = int(np.count_nonzero(inliers))
+            error = float(np.mean(residual[inliers])) if count else float('inf')
+            if (best_inliers is None or
+                    count > int(np.count_nonzero(best_inliers)) or
+                    (count == int(np.count_nonzero(best_inliers)) and
+                     error < best_error)):
+                best_inliers = inliers
+                best_error = error
+        required_stem_inliers = max(6, int(math.ceil(len(stem_rows) * 0.50)))
+        if (best_inliers is None or
+                int(np.count_nonzero(best_inliers)) < required_stem_inliers):
+            return empty
+        stem_ys_fit = stem_ys[best_inliers]
+        stem_centers_fit = stem_centers[best_inliers]
+        stem_slope, stem_intercept = np.polyfit(
+            stem_ys_fit, stem_centers_fit, 1)
+        stem_fit = stem_slope * stem_ys_fit + stem_intercept
+        stem_rms = float(np.sqrt(np.mean((stem_centers_fit - stem_fit) ** 2)))
+        # 车身不一定与进入段完全对齐，允许主干在画面中有一定
+        # 斜度；普通弯道仍由前面更稳定的横臂长宽比条件排除。
+        if (abs(float(stem_slope)) > 1.10 or stem_rms > inlier_tol):
+            return empty
+        stem_rows = [item for item, keep in zip(stem_rows, best_inliers)
+                     if keep]
+
+        # 用已经收窄且通过直线性验证的主干确定拐点，避免把
+        # 横臂与主干的过渡区当成道路中心。
         stem_x = float(np.median([(item[1] + item[2]) * 0.5
                                   for item in stem_rows]))
 
@@ -609,6 +667,7 @@ class LineFollower:
         self._filtered_angle = 0.0
         self._has_prev = False      # 是否已有上一帧有效误差(首帧不微分)
         self._last_z = 0.0
+        self._lost_entry_z = 0.0   # 失线瞬间的原始转向（反相前）
         self._last_sign = 1         # 最后一次有效误差方向(失线搜索用)
         self._lost_count = 0
         self._no_frame_count = 0
@@ -669,19 +728,13 @@ class LineFollower:
                 corner_near = float(det.get('corner_y_ratio', 0.0)) >= 0.52
                 if (self._corner_dir == 0 and self._started and
                         det['is_valid'] and observed_corner and corner_near):
-                    if observed_corner == self._corner_confirm_dir:
-                        self._corner_confirm_count += 1
-                    else:
-                        self._corner_confirm_dir = observed_corner
-                        self._corner_confirm_count = 1
-                    if self._corner_confirm_count >= 4:
-                        self._corner_dir = observed_corner
-                        self._corner_frames = 0
-                        self._corner_phase = 'advance'
-                        self._corner_turn_radians = 0.0
-                        logger.info('连续4帧确认%s L 弯，跨度=%.0fpx，先低速直行越过拐点',
-                                    '左' if observed_corner < 0 else '右',
-                                    float(det.get('corner_span', 0.0)))
+                    self._corner_dir = observed_corner
+                    self._corner_frames = 0
+                    self._corner_phase = 'advance'
+                    self._corner_turn_radians = 0.0
+                    logger.info('识别到%s L 弯，跨度=%.0fpx，立即进入后续流程',
+                                '左' if observed_corner < 0 else '右',
+                                float(det.get('corner_span', 0.0)))
                 elif self._corner_dir == 0:
                     self._corner_confirm_dir = 0
                     self._corner_confirm_count = 0
@@ -885,9 +938,10 @@ class LineFollower:
                     self._has_prev = False
                     self._filtered_err = 0.0
                     self._filtered_angle = 0.0
-                    self._last_z = 0.0
                     if not self._started:
                         # 起步期间失线：不前进也不旋转搜索，原地停车等线出现
+                        self._last_z = 0.0
+                        self._lost_entry_z = 0.0
                         self._start_seen = 0
                         state, z, speed = 'start-lost', 0, 0
                         self.chassis.send_speed(0, 0, 0)
@@ -981,8 +1035,8 @@ class LineFollower:
     # ------------------------------------------------------------------
     def _handle_lost(self):
         """失线处理(分三阶段，全部低速安全执行)：
-        1) lost-hold   短暂低速直行，等线重新回进视野；
-        2) lost-search 朝最后一次见线的方向旋转搜索，超过半程后自动换向，
+        1) lost-hold   低速前进并保留失线前转向，再逐渐衰减；
+        2) lost-search 朝失线前的实际转向方向旋转搜索，超过半程后自动换向，
                        避免单一方向找不回(曲线弯后线可能跑向另一侧)；
         3) lost-stop   仍未找回则停车等待。
         返回 (state, z, speed)。
@@ -995,7 +1049,10 @@ class LineFollower:
         # 所有非零速度都必须有明确帧数上限；不允许无限前进或无限旋转。
         # 验收：遮住线路后车辆在规定时间内停车，重新出现线路后可恢复。
         self._lost_count += 1
+        if self._lost_count == 1:
+            self._lost_entry_z = float(self._last_z)
         if self.base_speed <= 0:
+            self._last_z = 0.0
             self.chassis.send_speed(0, 0, 0)
             return 'lost-stop', 0, 0
         hold_limit = max(0, int(self.lost_hold))
@@ -1003,20 +1060,36 @@ class LineFollower:
 
         if self._lost_count <= hold_limit:
             speed = max(0, int(round(self.base_speed * 0.25)))
-            self.chassis.send_speed(speed, 0, 0)
-            return 'lost-hold', 0, speed
+            # 从失线前转向平滑衰减到 30%，短暂遮挡时继续沿原弯道
+            # 走，避免立即归零后沿切线驶出路径。
+            progress = self._lost_count / max(1.0, float(hold_limit))
+            hold_z_raw = self._lost_entry_z * (1.0 - 0.70 * progress)
+            self._last_z = hold_z_raw
+            z = -hold_z_raw if self.z_invert else hold_z_raw
+            z = float(np.clip(z, -abs(self.max_z), abs(self.max_z)))
+            self.chassis.send_speed(speed, 0, int(z))
+            return 'lost-hold', z, speed
 
         search_index = self._lost_count - hold_limit
         if search_index <= search_limit:
-            direction = self._last_sign
+            # 横向误差的符号不一定等于转向方向（角度前馈可能占
+            # 主导），优先使用失线前的真实控制转向符号。
+            if abs(self._lost_entry_z) >= 20.0:
+                direction = 1 if self._lost_entry_z > 0 else -1
+            else:
+                direction = self._last_sign
             if search_index > (search_limit + 1) // 2:
                 direction = -direction
-            z = direction * min(abs(float(self.max_z)), 200.0)
+            z_raw = direction * min(abs(float(self.max_z)), 200.0)
+            self._last_z = z_raw
+            z = z_raw
             if self.z_invert:
                 z = -z
             self.chassis.send_speed(0, 0, int(z))
             return 'lost-search', z, 0
 
+        self._last_z = 0.0
+        self._lost_entry_z = 0.0
         self.chassis.send_speed(0, 0, 0)
         return 'lost-stop', 0, 0
 
