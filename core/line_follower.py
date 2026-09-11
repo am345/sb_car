@@ -251,6 +251,17 @@ class LineDetector:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
+        # A false foreground patch can produce three adjacent scan hits while
+        # a real road stripe should span a meaningful vertical part of the ROI.
+        # Reject short chains before fitting and clear the track anchor so the
+        # next frame can reacquire globally.
+        scan_span = max(point[1] for point in points) - min(
+            point[1] for point in points)
+        min_scan_span = max(24, int(round(roi_h * 0.18)))
+        if scan_span < min_scan_span:
+            self._prev_cx = None
+            return self._empty_result(binary=binary, roi_top=roi_top)
+
         if corner.get('junction_straight') and self.path_preference is None:
             # 交叉点的横臂会成为扫描行里的最长黑段并把拟合中心拉向支路。
             # 只保留贴近贯穿主干的点，让车辆沿进入路口时的主线直行。
