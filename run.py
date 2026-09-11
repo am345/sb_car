@@ -16,8 +16,8 @@ USB 摄像头读取地面画面 → 提取线中心与方向 → PD 控制 → �
     python run.py --binary-mode otsu  # 学生手写 Otsu（默认）
     python run.py --speed 160         # 直道巡航速度 mm/s
     python run.py --kp 2.0 --kd 1.0   # PD 增益
-    python run.py --crop-bottom 0.25  # 近车头裁剪宽度比例
-    python run.py --crop-top 0.60     # 远处裁剪宽度比例（转弯余量）
+    python run.py --crop-bottom 0.70  # 近车头裁剪宽度比例
+    python run.py --crop-top 0.90     # 远处裁剪宽度比例（转弯余量）
     python run.py --track-half 50     # 滑动搜索窗半宽 px
     python run.py --max-frames 600    # 跑 600 帧后自动停止
 """
@@ -178,10 +178,10 @@ def main():
                         help='扫描行数（默认12）')
     parser.add_argument('--scan-start', type=float, default=0.25,
                         help='扫描起点在ROI内的比例(0~1，默认0.25)')
-    parser.add_argument('--crop-bottom', type=float, default=0.50,
-                        help='近车头裁剪宽度比例(0~1，需足以容纳转向时的线，默认0.50)')
-    parser.add_argument('--crop-top', type=float, default=0.60,
-                        help='远处裁剪宽度比例(0~1，越大越宽=转弯余量，默认0.60)')
+    parser.add_argument('--crop-bottom', type=float, default=0.70,
+                        help='近车头裁剪宽度比例(0~1，需足以容纳转向时的线，默认0.70)')
+    parser.add_argument('--crop-top', type=float, default=0.90,
+                        help='远处裁剪宽度比例(0~1，越大越宽=转弯余量，默认0.90)')
     parser.add_argument('--track-half', type=float, default=60.0,
                         help='滑动搜索窗半宽 px（默认60，越大越不易丢线但抗干扰弱）')
     parser.add_argument('--work-width', type=int, default=320,
