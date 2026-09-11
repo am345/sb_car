@@ -36,6 +36,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 from debug_web import DebugWebServer  # noqa: E402
 from core.line_follower import LineFollower  # noqa: E402
+from core.trajectory_memory import trajectory_geometry  # noqa: E402
 
 
 logging.basicConfig(
@@ -386,14 +387,8 @@ follower = LineFollower(
     # 20 Hz limiter then keeps simulated time and wall time approximately 1:1.
     target_fps=20,
     web_debug=output,
-    trajectory_geometry={
-        'image_width': 320,
-        'image_height': 240,
-        'horizontal_fov_deg': 90.0,
-        'camera_height_m': 0.14,
-        'pitch_down_deg': math.degrees(0.14),
-        'camera_forward_m': 0.115,
-    },
+    trajectory_geometry=trajectory_geometry(
+        640, 480, 320, 90.0, 0.14, math.degrees(0.14), 0.115),
 )
 follower_holder["follower"] = follower
 

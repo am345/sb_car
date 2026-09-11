@@ -1,7 +1,8 @@
 import math
 import unittest
 
-from core.trajectory_memory import GroundProjector, TrajectoryMemory
+from core.trajectory_memory import (
+    GroundProjector, TrajectoryMemory, trajectory_geometry)
 
 
 def pose(x=0.0, y=0.0, yaw=0.0, distance=0.0):
@@ -14,6 +15,12 @@ def pose(x=0.0, y=0.0, yaw=0.0, distance=0.0):
 
 
 class TrajectoryMemoryTests(unittest.TestCase):
+    def test_real_and_sim_camera_use_same_work_image_geometry_builder(self):
+        geometry = trajectory_geometry(
+            640, 480, 320, 90, .14, 8.02, .115)
+        self.assertEqual(geometry['image_width'], 320)
+        self.assertEqual(geometry['image_height'], 240)
+
     def test_bottom_pixel_matches_simulated_camera_blind_distance(self):
         projector = GroundProjector(
             320, 240, horizontal_fov_deg=90,

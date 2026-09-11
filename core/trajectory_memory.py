@@ -4,6 +4,21 @@
 import math
 
 
+def trajectory_geometry(source_width, source_height, work_width,
+                        horizontal_fov_deg, camera_height_m,
+                        pitch_down_deg, camera_forward_m):
+    """Build the shared working-image calibration for real and simulated cameras."""
+    scale = float(work_width) / float(source_width)
+    return {
+        'image_width': int(work_width),
+        'image_height': int(round(float(source_height) * scale)),
+        'horizontal_fov_deg': float(horizontal_fov_deg),
+        'camera_height_m': float(camera_height_m),
+        'pitch_down_deg': float(pitch_down_deg),
+        'camera_forward_m': float(camera_forward_m),
+    }
+
+
 class GroundProjector:
     """Flat-ground pinhole projection; vehicle axes are forward/right."""
 

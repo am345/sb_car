@@ -304,6 +304,20 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(runner._tracking(det, .05, 0.05, 'main')[2], 0)
         self.assertNotEqual(runner._tracking(det, .05, 0.10, 'main')[2], 0)
 
+    def test_memory_target_bypasses_delay_and_stops_translation_at_right_angle(self):
+        follower = SimpleNamespace(
+            base_speed=300, max_z=800, kp=12.0, kd=0.0, ka=3.5,
+            err_alpha=1.0, z_rate_limit=800, z_invert=True)
+        runner = TrafficControlRunner(follower, control_delay_m=.10)
+        det = {'is_valid': True, 'memory_active': True,
+               'error_px': 0, 'angle_deg': 90,
+               'selected_branch_direction': None}
+
+        command = runner._tracking(det, .05, 0.0, 'main')
+
+        self.assertEqual(command[0], 0)
+        self.assertNotEqual(command[2], 0)
+
     def test_route_change_discards_queued_straight_targets(self):
         follower = SimpleNamespace(
             base_speed=300, max_z=800, kp=12.0, kd=0.0, ka=0.0,

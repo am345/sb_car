@@ -40,6 +40,7 @@ if _CASE_DIR not in sys.path:
 from comm.chassis import ChassisController
 from comm.usb_camera import USBCamera
 from core.line_follower import LineFollower
+from core.trajectory_memory import trajectory_geometry
 from debug_web import CONFIG_SCHEMA, DebugWebServer
 
 
@@ -118,6 +119,14 @@ def main():
                         help='网页图像刷新率上限（默认8 FPS）')
     parser.add_argument('--exposure', type=int, default=150,
                         help='摄像头手动曝光值（默认150）')
+    parser.add_argument('--camera-hfov-deg', type=float, default=90.0,
+                        help='摄像头水平视场角，轨迹记忆地面投影使用（默认90°）')
+    parser.add_argument('--camera-height-m', type=float, default=0.14,
+                        help='摄像头离地高度，轨迹记忆使用（默认0.14m）')
+    parser.add_argument('--camera-pitch-deg', type=float, default=8.02,
+                        help='摄像头向下俯角，轨迹记忆使用（默认8.02°）')
+    parser.add_argument('--camera-forward-m', type=float, default=0.115,
+                        help='摄像头相对车体旋转中心向前距离（默认0.115m）')
     parser.add_argument('--speed', type=int, default=160,
                         help='直道巡航速度 mm/s（底盘限幅 ±300）')
     parser.add_argument('--max-z', type=int, default=800,
@@ -182,6 +191,12 @@ def main():
     if saved_config.get('binary_mode') in ('fixed', 'otsu', 'adaptive'):
         parser.set_defaults(binary_mode=saved_config['binary_mode'])
     args = parser.parse_args()
+    if not 1.0 < args.camera_hfov_deg < 179.0:
+        parser.error('--camera-hfov-deg 必须在 1~179° 之间')
+    if args.camera_height_m <= 0:
+        parser.error('--camera-height-m 必须大于 0')
+    if not -45.0 < args.camera_pitch_deg < 90.0:
+        parser.error('--camera-pitch-deg 必须在 -45~90° 之间')
     if args.sign_only and not args.traffic_control:
         parser.error('--sign-only 必须与 --traffic-control 配合使用')
     if args.traffic_control:
@@ -318,6 +333,11 @@ def main():
             return
 
     # 4. 巡线控制器
+    source_width, source_height = camera.actual_size or (640, 480)
+    memory_geometry = trajectory_geometry(
+        source_width, source_height, args.work_width,
+        args.camera_hfov_deg, args.camera_height_m,
+        args.camera_pitch_deg, args.camera_forward_m)
     follower = LineFollower(
         camera, chassis,
         base_speed=args.speed,
@@ -345,11 +365,15 @@ def main():
         z_invert=not args.no_z_invert,   # 转向方向取反（默认 True）
         debug=args.debug,
         web_debug=web_debug,
+        trajectory_geometry=memory_geometry,
     )
     follower_holder['follower'] = follower
     logger.info('极性=%s 二值化=%s 裁切(底%.2f/顶%.2f) 搜索窗=%gpx 转向取反=%s',
                 polarity, args.binary_mode, args.crop_bottom, args.crop_top, args.track_half,
                 not args.no_z_invert)
+    logger.info('轨迹记忆已启用: HFOV=%.1f° 高度=%.3fm 俯角=%.2f° 前移=%.3fm',
+                args.camera_hfov_deg, args.camera_height_m,
+                args.camera_pitch_deg, args.camera_forward_m)
 
     restart_requested = False
     try:

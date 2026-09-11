@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 
+from core.line_follower import LineFollower
 from core.traffic_behavior import TrafficBehavior
 
 logger = logging.getLogger(__name__)
@@ -257,7 +258,12 @@ class TrafficControlRunner:
             'angle_deg': float(det['angle_deg']),
             'selected_branch_direction': det.get('selected_branch_direction'),
         }
-        if odom_distance_m is not None and self.control_delay_m > 0:
+        memory_active = bool(det.get('memory_active'))
+        if memory_active:
+            # A recalled cue is already expressed at the current vehicle pose;
+            # delaying it again would apply the stored slope too late.
+            self._clear_control_queue()
+        elif odom_distance_m is not None and self.control_delay_m > 0:
             distance = float(odom_distance_m)
             if not math.isfinite(distance):
                 self._clear_control_queue()
@@ -309,6 +315,8 @@ class TrafficControlRunner:
         if self.policy.state == 'branch-follow':
             return (round(base), 0, round(z))
         speed = base*curve
+        if memory_active:
+            speed *= LineFollower.trajectory_speed_scale(angle)
         if abs(err) > 40:
             speed = min(speed, base*0.3)
         return (round(speed), 0, round(z))
@@ -338,6 +346,9 @@ class TrafficControlRunner:
                     f.odometry.update(status, timestamp=now)
                 f.detector.path_preference = self._detector_path_preference()
                 det = f.detector.process(frame)
+                pose = f.odometry.snapshot()
+                if status is not None:
+                    det, _ = f._apply_trajectory_memory(det, pose)
                 self.last_line_valid = bool(det.get('is_valid'))
                 result = f.web_debug.get_traffic_status()
                 self._associate_roadblock(result, det)
@@ -367,7 +378,6 @@ class TrafficControlRunner:
                         self.lost_since = now if self.lost_since is None else self.lost_since
                         if now-self.lost_since > 2:
                             self.trip('持续失线')
-                    pose = f.odometry.snapshot()
                     route_id = ('branch:' + self.policy.locked_branch
                                 if self.policy.locked_branch else
                                 ('inactive:' + self.policy.state

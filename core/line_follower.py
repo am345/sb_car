@@ -1258,6 +1258,12 @@ class LineFollower:
         })
         return result, cue
 
+    @staticmethod
+    def trajectory_speed_scale(heading_error_deg):
+        """Shared translation scale while following a remembered slope."""
+        return max(0.0, math.cos(math.radians(
+            abs(float(heading_error_deg)))))
+
     def _manual_control_step(self):
         pose = self.odometry.snapshot()
         now = time.monotonic()
@@ -1547,8 +1553,8 @@ class LineFollower:
                                 radius_px / 110.0, 0.22, 1.0))
                             curve_scale = min(curve_scale, curvature_scale)
                         if memory_cue is not None:
-                            heading_scale = max(0.0, math.cos(math.radians(
-                                abs(memory_cue['heading_error_deg']))))
+                            heading_scale = self.trajectory_speed_scale(
+                                memory_cue['heading_error_deg'])
                             curve_scale = min(curve_scale, heading_scale)
                         speed = int(round(self.base_speed * ramp * curve_scale))
                         if abs(err) > 40:
