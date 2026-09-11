@@ -370,6 +370,7 @@ def main():
         debug=args.debug,
         web_debug=web_debug,
         line_width_model=REAL_LINE_WIDTH_MODEL,
+        enforce_width=False,
     )
     follower_holder['follower'] = follower
     logger.info('极性=%s 二值化=%s 裁切(底%.2f/顶%.2f) 搜索窗=%gpx 转向取反=%s',

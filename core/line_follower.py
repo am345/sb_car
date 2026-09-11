@@ -44,7 +44,7 @@ class LineDetector:
                  track_half=50.0, scan_start_ratio=0.25,
                  binary_mode='otsu', fixed_threshold=100,
                  adaptive_block=31, adaptive_c=8.0,
-                 line_width_model=None):
+                 line_width_model=None, enforce_width=True):
         self.work_width = work_width
         self.roi_top_ratio = roi_top_ratio          # 垂直方向：只处理底部这段(车前方地面)
         self.n_scan_rows = n_scan_rows              # 扫描行数
@@ -61,6 +61,7 @@ class LineDetector:
         self.adaptive_c = float(adaptive_c)
         self.line_width_model = self._validate_line_width_model(
             line_width_model)
+        self.enforce_width = bool(enforce_width)
 
         # 上一帧车头参考行处的线中心(工作图 x)，兼作本帧搜索窗中心
         self._prev_cx = None
@@ -295,13 +296,17 @@ class LineDetector:
             physical_widths = [width for width in physical_widths
                                if width is not None and math.isfinite(width)]
             if not physical_widths:
-                self._prev_cx = None
-                return self._empty_result(binary=binary, roi_top=roi_top)
-            line_width_mm = float(np.median(physical_widths))
-            if not (self.line_width_model['min_width_mm'] <= line_width_mm <=
-                    self.line_width_model['max_width_mm']):
-                self._prev_cx = None
-                return self._empty_result(binary=binary, roi_top=roi_top)
+                if self.enforce_width:
+                    self._prev_cx = None
+                    return self._empty_result(binary=binary, roi_top=roi_top)
+            else:
+                line_width_mm = float(np.median(physical_widths))
+                if (self.enforce_width and not
+                        (self.line_width_model['min_width_mm'] <= line_width_mm <=
+                         self.line_width_model['max_width_mm'])):
+                    self._prev_cx = None
+                    return self._empty_result(binary=binary, roi_top=roi_top)
+            # Physical width is diagnostic when enforcement is disabled.
         else:
             near_width_limit = max(25.0, ww * 0.08)
             if float(np.median(near_widths)) > near_width_limit:
@@ -647,14 +652,24 @@ class LineDetector:
                 if best_s < 0 or end - start > best_e - best_s:
                     best_s, best_e = start, end
 
-            if guided:
-                # Stay with the tangent continuation. Choosing the leftmost
-                # branch unconditionally would enter the circle's diameter.
-                minimum = max(self.min_seg_width, round(3+5*rel_y/max(1, roi_h-1)))
-                candidates = [s for s in segments if s[1]-s[0] >= minimum]
-                if candidates:
-                    best_s, best_e = min(candidates,
-                        key=lambda s: abs(l0+(s[0]+s[1])/2-anchor))
+            minimum = max(self.min_seg_width,
+                          round(3 + 5 * rel_y / max(1, roi_h-1)))
+            candidates = [s for s in segments if s[1]-s[0] >= minimum]
+            if candidates:
+                if guided:
+                    # Branch policy explicitly controls continuation choice.
+                    best_s, best_e = min(
+                        candidates,
+                        key=lambda s: abs(l0 + (s[0]+s[1])/2-anchor))
+                elif pred is not None:
+                    # Hybrid mode: teacher-style multi-run scan with the
+                    # current track as a soft anchor. Nearby runs win; width
+                    # only breaks ties instead of dominating the choice.
+                    best_s, best_e = max(
+                        candidates,
+                        key=lambda s: (
+                            -abs(l0 + (s[0]+s[1])/2-anchor),
+                            s[1]-s[0]))
 
             if best_s < 0:
                 continue
@@ -991,7 +1006,7 @@ class LineFollower:
                  adaptive_block=31, adaptive_c=8.0,
                  z_invert=True,   # 转向方向取反（默认 True）
                  target_fps=20, debug=False, web_debug=None,
-                 line_width_model=None):
+                 line_width_model=None, enforce_width=False):
         self.camera = camera
         self.chassis = chassis
         self.base_speed = base_speed
@@ -1020,7 +1035,7 @@ class LineFollower:
             track_half=track_half, polarity=polarity,
             binary_mode=binary_mode, fixed_threshold=fixed_threshold,
             adaptive_block=adaptive_block, adaptive_c=adaptive_c,
-            line_width_model=line_width_model)
+            line_width_model=line_width_model, enforce_width=enforce_width)
         self.target_fps = target_fps
         self.frame_interval = 1.0 / max(1, target_fps)
         self.debug = debug
