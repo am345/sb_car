@@ -19,11 +19,14 @@
 """
 import logging
 import math
+import threading
 import time
 from itertools import combinations
 
 import cv2
 import numpy as np
+
+from core.odometry import ImuOdometry
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +61,20 @@ class LineDetector:
 
         # 上一帧车头参考行处的线中心(工作图 x)，兼作本帧搜索窗中心
         self._prev_cx = None
+        # Only the opt-in traffic controller requests branch selection.
+        self.path_preference = None
+        # A left/right road becomes forward-facing after the vehicle enters it.
+        # Remember that capture so its per-frame label can hand off to straight.
+        self._captured_turn = None
 
     # ------------------------------------------------------------------
     def process(self, frame):
         """处理一帧，返回检测结果 dict。"""
         empty = self._empty_result()
+        if self.path_preference not in ('left', 'right'):
+            self._captured_turn = None
+        elif self._captured_turn not in (None, self.path_preference):
+            self._captured_turn = None
         if frame is None or frame.size == 0:
             return empty
 
@@ -125,6 +137,34 @@ class LineDetector:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
+        # Branch discovery gets a wider trapezoid than ordinary tracking. The
+        # normal mask stays narrow for noise rejection; only candidates that
+        # reconnect to the near stem are accepted from this wider view.
+        branch_fractions = np.linspace(max(top_frac, 0.90),
+                                       max(bottom_frac, 0.70), roi_h)
+        branch_half = branch_fractions * ww * 0.5
+        branch_inside = ((columns >= (center-branch_half)[:, None]) &
+                         (columns < (center+branch_half)[:, None]))
+        if self.binary_mode == 'adaptive':
+            branch_binary = self._adaptive_binary(blur, branch_inside)
+        else:
+            branch_binary = self._apply_global_threshold(
+                blur, branch_inside, threshold)
+        branch_binary = cv2.morphologyEx(branch_binary, cv2.MORPH_CLOSE,
+                                         cv2.getStructuringElement(
+                                             cv2.MORPH_RECT, (3, 5)))
+        _, branch_labels, branch_stats, _ = cv2.connectedComponentsWithStats(
+            branch_binary, connectivity=8)
+        branch_mask = np.zeros_like(branch_binary)
+        for index in range(1, branch_labels.max()+1):
+            _, _, bw_, bh_, area = branch_stats[index]
+            if area < 25 or bh_ < roi_h*0.20:
+                continue
+            fill = area / float(bw_*bh_)
+            if bw_ > 8 and bh_ > 8 and fill > 0.85:
+                continue
+            branch_mask[branch_labels == index] = 255
+
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
@@ -160,15 +200,21 @@ class LineDetector:
         # --- 4. 扫描线 + 滑动搜索窗 ---
         # 预测位置作为搜索窗中心；丢线后重捕获时清空预测窗
         pred = self._prev_cx if self._prev_cx is not None else center
-        points = self._scan_lines(binary, roi_top, ww, inside, pred)
+        # Branch selection needs a neutral incoming-stem fit first. Once all
+        # candidates are built below, the requested left/right path replaces it.
+        baseline_preference = ('continuation' if self.path_preference in
+                               ('left', 'straight', 'right') else None)
+        points = self._scan_lines(binary, roi_top, ww, inside, pred,
+                                  baseline_preference)
         if len(points) < 3:
             # 重捕获：不受预测限制，直接在全裁切范围内找
-            points = self._scan_lines(binary, roi_top, ww, inside, None)
+            points = self._scan_lines(binary, roi_top, ww, inside, None,
+                                      baseline_preference)
         if len(points) < 3:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
-        if corner.get('junction_straight'):
+        if corner.get('junction_straight') and self.path_preference is None:
             # 交叉点的横臂会成为扫描行里的最长黑段并把拟合中心拉向支路。
             # 只保留贴近贯穿主干的点，让车辆沿进入路口时的主线直行。
             stem_x = float(corner['junction_stem_x'])
@@ -198,28 +244,82 @@ class LineDetector:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
+        split_candidates = self._detect_split_branches(
+            branch_mask, roi_top, ww, fit_coeffs, points)
+        branch_candidates = (split_candidates or
+                             self._branch_candidates(corner, ww))
+        chosen = None
+        if split_candidates:
+            directions = {item['direction'] for item in split_candidates}
+            split_y = max(item.get('split_y', roi_top)
+                          for item in split_candidates)
+            targets = [item['target_x'] for item in split_candidates]
+            corner = dict(corner)
+            corner.update({
+                'corner_point': (float(np.polyval(fit_coeffs, split_y)),
+                                 float(split_y)),
+                'corner_y_ratio': float((split_y-roi_top) /
+                                        max(1, roi_h-1)),
+                'corner_span': float(max(targets)-min(targets)),
+                'junction_left': 'left' in directions,
+                'junction_straight': 'straight' in directions,
+                'junction_right': 'right' in directions,
+                'junction_near': bool((split_y-roi_top) /
+                                      max(1, roi_h-1) >= 0.60),
+                'junction_stem_x': float(np.polyval(fit_coeffs, split_y)),
+            })
+            requested = self.path_preference
+            if requested == 'continuation':
+                requested = 'straight'
+            chosen = next((item for item in split_candidates
+                           if item['direction'] == requested), None)
+            if chosen is not None and requested in ('left', 'right'):
+                self._captured_turn = requested
+            if chosen is not None and chosen['direction'] != 'straight':
+                fit_coeffs = None
+                points = list(chosen['points'])
+
         # TODO-B4【二次拟合、横向误差与方向角】
         # 用 x = q2*y^2 + q1*y + q0 描述平滑弯道；车头参考点取
         # ROI 最底行，方向角取该点切线 dx/dy = 2*q2*y + q1。
-        q2, q1, q0 = fit_coeffs
         ref_y = roi_top + roi_h - 1
-        cx_fit = float(np.clip(q2 * ref_y ** 2 + q1 * ref_y + q0,
-                               0.0, ww - 1.0))
-        error_px = cx_fit - ww / 2.0
-        tangent = 2.0 * q2 * ref_y + q1
-        angle_deg = math.degrees(math.atan(-tangent))
+        if chosen is not None and chosen['direction'] != 'straight':
+            error_px = float(chosen['error_px'])
+            cx_fit = float(np.clip(ww/2.0 + error_px, 0.0, ww-1.0))
+            angle_deg = float(chosen['angle_deg'])
+        else:
+            q2, q1, q0 = fit_coeffs
+            cx_fit = float(np.clip(q2*ref_y**2 + q1*ref_y + q0,
+                                   0.0, ww-1.0))
+            error_px = cx_fit - ww/2.0
+            tangent = 2.0*q2*ref_y + q1
+            angle_deg = math.degrees(math.atan(-tangent))
         if self._prev_cx is None:
             self._prev_cx = cx_fit
         else:
             self._prev_cx = 0.6 * cx_fit + 0.4 * self._prev_cx
+
+        far_limit = roi_top + int(roi_h * 0.45)
+        near_limit = roi_top + int(roi_h * 0.75)
+        far_points = sum(1 for point in points if point[1] <= far_limit)
+        close_points = sum(1 for point in points if point[1] >= near_limit)
+        # This is only a per-frame candidate. TrafficBehavior additionally
+        # requires three frames and matching forward odometry before treating
+        # it as the natural end of the cross branch.
+        line_end_candidate = close_points >= 2 and far_points <= 1
 
         return {
             'is_valid': True,
             'centroid': (cx_fit, float(ref_y)),
             'error_px': float(error_px),          # 线在右 → 正 → 右转
             'angle_deg': float(angle_deg),
-            'fit_coeffs': (float(q2), float(q1), float(q0)),
+            'fit_coeffs': (None if fit_coeffs is None else
+                           tuple(float(value) for value in fit_coeffs)),
             **corner,
+            'branch_candidates': branch_candidates,
+            'selected_branch_direction': (None if chosen is None else
+                                          chosen['direction']),
+            'line_end_candidate': bool(line_end_candidate),
             'points': points,                   # 参与拟合的点
             'binary': binary,
             'roi_top': roi_top,
@@ -243,6 +343,155 @@ class LineDetector:
         runs.append(current)
         # 同长度时优先选择延伸到更靠近车头的位置。
         return max(runs, key=lambda run: (len(run), run[-1][1]))
+
+    @staticmethod
+    def _branch_candidates(corner, width):
+        """Expose stable relative branch identities to the policy layer.
+
+        The target x values are image-space association anchors, not steering
+        commands. They let a roadblock box be associated with a branch while
+        left/right/straight remain relative to the incoming stem.
+        """
+        point = corner.get('corner_point')
+        stem_x = (float(corner.get('junction_stem_x') or 0.0)
+                  if point is None else float(point[0]))
+        if point is None:
+            stem_x = width * 0.5
+            target_y = 0.0
+        else:
+            target_y = float(point[1])
+        extent = max(24.0, float(corner.get('corner_span') or 0.0) * 0.40)
+        result = []
+        if corner.get('junction_left'):
+            result.append({'direction': 'left',
+                           'target_x': max(0.0, stem_x - extent),
+                           'target_y': target_y})
+        if corner.get('junction_straight'):
+            result.append({'direction': 'straight',
+                           'target_x': stem_x, 'target_y': target_y})
+        if corner.get('junction_right'):
+            result.append({'direction': 'right',
+                           'target_x': min(float(width - 1), stem_x + extent),
+                           'target_y': target_y})
+        return result
+
+    def _detect_split_branches(self, binary, roi_top, width,
+                               main_fit, main_points):
+        """Build simultaneous left/straight/right paths from a shared stem.
+
+        Dense scan rows expose secondary tape segments that diverge from the
+        incoming path. Each side path must fit together with the two nearest
+        stem points, which rejects disconnected chair legs and shoes.
+        """
+        roi_h = binary.shape[0]
+        side_points = {-1: [], 1: []}
+        separation = max(18.0, width * 0.055)
+        first_row = 0
+        last_row = int(roi_h * 0.89)
+        for rel_y in range(first_row, last_row):
+            xs = np.flatnonzero(binary[rel_y])
+            if xs.size == 0:
+                continue
+            breaks = np.flatnonzero(np.diff(xs) > 1)
+            groups = np.split(xs, breaks + 1)
+            full_y = rel_y + roi_top
+            main_x = float(np.polyval(main_fit, full_y))
+            minimum = max(self.min_seg_width,
+                          int(round(3 + 5 * rel_y / max(1, roi_h-1))))
+            for group in groups:
+                if group.size < minimum:
+                    continue
+                x = float(np.mean(group))
+                delta = x - main_x
+                if abs(delta) >= separation:
+                    side_points[1 if delta > 0 else -1].append(
+                        (x, float(full_y), int(group.size)))
+
+        ordered_main = sorted(main_points, key=lambda point: point[1])
+        if len(ordered_main) < 3:
+            return []
+        candidates = []
+        ref_y = roi_top + roi_h - 1
+        for side, raw in side_points.items():
+            # Keep one dense, geometrically continuous side segment which can
+            # reconnect to the sampled incoming stem. This rejects the bottom
+            # lens/bumper shadow even when it is a long black segment.
+            runs = []
+            current = []
+            for point in raw:
+                if (current and
+                        (point[1]-current[-1][1] > 2 or
+                         abs(point[0]-current[-1][0]) > 14)):
+                    runs.append(current)
+                    current = []
+                current.append(point)
+            if current:
+                runs.append(current)
+            if not runs:
+                continue
+            viable = []
+            for run in runs:
+                if len(run) < 6 or run[-1][1]-run[0][1] < 5:
+                    continue
+                following = [point for point in ordered_main
+                             if point[1] >= run[-1][1]]
+                if not following:
+                    continue
+                junction = min(following, key=lambda point: point[1])
+                y_gap = float(junction[1])-float(run[-1][1])
+                x_gap = abs(float(junction[0])-float(run[-1][0]))
+                if (y_gap <= roi_h*0.22 and
+                        x_gap <= max(45.0, self.track_half*0.90)):
+                    viable.append((run, junction))
+            if not viable:
+                continue
+            run, junction = max(viable,
+                                key=lambda item: (len(item[0]),
+                                                  -item[1][1]))
+            stride = max(1, int(math.ceil(len(run)/8.0)))
+            branch_points = run[::stride]
+            if branch_points[-1] != run[-1]:
+                branch_points.append(run[-1])
+            common = [point for point in ordered_main
+                      if point[1] >= junction[1]]
+            path_points = sorted(branch_points + common,
+                                 key=lambda point: point[1])
+            near = ordered_main[-1]
+            look_x = float(np.median([point[0] for point in run]))
+            look_y = float(np.median([point[1] for point in run]))
+            forward = max(1.0, float(junction[1])-look_y)
+            angle = math.degrees(math.atan2(
+                look_x-float(junction[0]), forward))
+            candidates.append({
+                'direction': 'right' if side > 0 else 'left',
+                'target_x': float(np.median([p[0] for p in run])),
+                'target_y': float(np.median([p[1] for p in run])),
+                'split_y': float(junction[1]),
+                'fit_coeffs': None,
+                'points': path_points,
+                # Drive toward the selected side route, not the shared
+                # straight stem at the bottom of the image.
+                'error_px': look_x-width/2.0,
+                'angle_deg': float(angle),
+            })
+        if not candidates:
+            return []
+        q2, q1, q0 = main_fit
+        main_cx = float(np.clip(np.polyval(main_fit, ref_y), 0, width-1))
+        straight = {
+            'direction': 'straight',
+            'target_x': float(np.polyval(main_fit, roi_top)),
+            'target_y': float(roi_top),
+            'split_y': float(max(item['split_y'] for item in candidates)),
+            'fit_coeffs': tuple(float(value) for value in main_fit),
+            'points': list(main_points),
+            'error_px': main_cx - width/2.0,
+            'angle_deg': float(math.degrees(
+                math.atan(-(2*q2*ref_y + q1)))),
+        }
+        order = {'left': 0, 'straight': 1, 'right': 2}
+        return sorted(candidates + [straight],
+                      key=lambda item: order[item['direction']])
 
     @staticmethod
     def _robust_quadratic_fit(points, residual_limit=8.0):
@@ -275,7 +524,8 @@ class LineDetector:
         return tuple(float(value) for value in coeffs), inlier_points
 
     # ------------------------------------------------------------------
-    def _scan_lines(self, binary, roi_top, ww, inside, pred):
+    def _scan_lines(self, binary, roi_top, ww, inside, pred,
+                    preference_override=None):
         """对每一扫描行，在"裁切窗 ∩ 预测窗"内找最宽暗色段，返回 [(x, y, w), ...]。
 
         y 为整图坐标；pred 为 None 时(重捕获)只用裁切窗。
@@ -294,6 +544,12 @@ class LineDetector:
         roi_h = binary.shape[0]
         rows = np.linspace(int(roi_h * self.scan_start_ratio),
                            roi_h - 1, self.n_scan_rows).astype(int)
+        preference = (self.path_preference if preference_override is None
+                      else preference_override)
+        guided = preference in ('left', 'right', 'continuation')
+        if guided:
+            rows = rows[::-1]  # trace the connected approach from near to far
+        anchor = ww/2 if pred is None else pred
         points = []
         for rel_y in rows:
             mask_row = np.nonzero(inside[rel_y])[0]
@@ -308,6 +564,7 @@ class LineDetector:
 
             seg = binary[rel_y, l0:r0]
             best_s, best_e = -1, -1
+            segments = []
 
             # 在此补全最长连续非零段搜索。
             # 可使用 while 循环，也可先用 np.flatnonzero 获得前景下标，
@@ -321,8 +578,18 @@ class LineDetector:
                 while i < seg.size and seg[i] != 0:
                     i += 1
                 end = i
+                segments.append((start, end))
                 if best_s < 0 or end - start > best_e - best_s:
                     best_s, best_e = start, end
+
+            if guided:
+                # Stay with the tangent continuation. Choosing the leftmost
+                # branch unconditionally would enter the circle's diameter.
+                minimum = max(self.min_seg_width, round(3+5*rel_y/max(1, roi_h-1)))
+                candidates = [s for s in segments if s[1]-s[0] >= minimum]
+                if candidates:
+                    best_s, best_e = min(candidates,
+                        key=lambda s: abs(l0+(s[0]+s[1])/2-anchor))
 
             if best_s < 0:
                 continue
@@ -334,8 +601,17 @@ class LineDetector:
             if bw < max(self.min_seg_width, perspective_min_width):
                 continue
             cx = l0 + (best_s + best_e) // 2
+            if guided:
+                if bw > max(25, perspective_min_width*4):
+                    if preference == 'left':
+                        cx = l0 + best_s + perspective_min_width
+                    elif preference == 'right':
+                        cx = l0 + best_e - 1 - perspective_min_width
+                    else:
+                        cx = int(np.clip(anchor, l0+best_s, l0+best_e-1))
+                anchor = pred = cx
             points.append((cx, rel_y + roi_top, bw))
-        return points
+        return sorted(points, key=lambda p: p[1]) if guided else points
 
     def _detect_l_corner(self, binary, roi_top):
         """检测单侧横臂的 L 弯；方向 -1=左，+1=右，0=未检测到。"""
@@ -345,9 +621,15 @@ class LineDetector:
             'corner_point': None,
             'corner_y_ratio': 0.0,
             'corner_span': 0.0,
+            'junction_left': False,
+            'junction_right': False,
+            'junction_near': False,
             'junction_straight': False,
             'junction_stem_x': 0.0,
             'junction_normal_width': 0.0,
+            'branch_candidates': [],
+            'selected_branch_direction': None,
+            'line_end_candidate': False,
         }
         rows = []
         for y in range(roi_h):
@@ -460,9 +742,15 @@ class LineDetector:
         upper_continues = (len(upper_stem_rows) >= required_upper and
                            upper_stem_rows[-1][0] - upper_stem_rows[0][0]
                            >= required_upper - 1)
+        junction_geometry = {
+            'junction_left': bool(stem_x-arm_left >= ww*0.10),
+            'junction_right': bool(arm_right-stem_x >= ww*0.10),
+            'junction_near': bool(arm_y/max(1, roi_h-1) >= 0.60),
+        }
         if upper_continues:
             result = dict(empty)
             result.update({
+                **junction_geometry,
                 'corner_point': (stem_x, float(arm_y + roi_top)),
                 'corner_y_ratio': float(arm_y / max(1, roi_h - 1)),
                 'corner_span': float(span),
@@ -481,7 +769,9 @@ class LineDetector:
         # 只要主干左右都存在足够长的横臂，就优先归为交叉口，绝不能按
         # “较长的一边”冒充 L 弯。
         if left_extent >= min_arm and right_extent >= min_arm:
-            return empty
+            return {**empty, **junction_geometry,
+                    'corner_point': (stem_x, float(arm_y+roi_top)),
+                    'corner_y_ratio': float(arm_y/max(1, roi_h-1))}
         if right_extent >= min_arm and right_extent >= left_extent + margin:
             direction = 1
         elif left_extent >= min_arm and left_extent >= right_extent + margin:
@@ -490,6 +780,7 @@ class LineDetector:
             return empty                 # T/十字路口，不冒充 L 弯
 
         return {
+            **junction_geometry,
             'corner_dir': direction,
             'corner_point': (stem_x, float(arm_y + roi_top)),
             'corner_y_ratio': float(arm_y / max(1, roi_h - 1)),
@@ -580,9 +871,14 @@ class LineDetector:
             'corner_point': None,
             'corner_y_ratio': 0.0,
             'corner_span': 0.0,
+            'junction_left': False,
+            'junction_right': False,
+            'junction_near': False,
             'junction_straight': False,
             'junction_stem_x': 0.0,
             'junction_normal_width': 0.0,
+            'branch_candidates': [],
+            'line_end_candidate': False,
             'points': [],
             'binary': binary,
             'roi_top': roi_top,
@@ -684,9 +980,222 @@ class LineFollower:
         self.fps = 0.0
         self._fps_n = 0
         self._fps_t = time.time()
+        self.odometry = ImuOdometry()
+        self._last_chassis_status = None
+        self._manual_mode = threading.Event()
+        self._resume_tracking = threading.Event()
+        self._manual_lock = threading.Lock()
+        self._manual_target = None
+        self._manual_state = '视觉循迹'
+        self._manual_phase = 'idle'
+        self._manual_remaining_m = 0.0
+        self._manual_remaining_deg = 0.0
+
+    def reset_odometry(self):
+        self.odometry.reset()
+        logger.info('IMU 里程计已清零')
+
+    @staticmethod
+    def _angle_error(target_deg, current_deg):
+        return (target_deg - current_deg + 180.0) % 360.0 - 180.0
+
+    def set_manual_mode(self, enabled):
+        enabled = bool(enabled)
+        if enabled:
+            self._manual_mode.set()
+            with self._manual_lock:
+                self._manual_target = None
+                self._manual_state = '手动模式待命'
+                self._manual_phase = 'idle'
+                self._manual_remaining_m = 0.0
+                self._manual_remaining_deg = 0.0
+            self.chassis.stop()
+            logger.warning('已切换到手动里程控制，视觉控制暂停')
+        else:
+            self.chassis.stop()
+            with self._manual_lock:
+                self._manual_target = None
+                self._manual_state = '视觉循迹'
+                self._manual_phase = 'idle'
+                self._manual_remaining_m = 0.0
+                self._manual_remaining_deg = 0.0
+            self._resume_tracking.set()
+            self._manual_mode.clear()
+            logger.warning('已退出手动里程控制，恢复视觉循迹')
+        return self.manual_control_status()
+
+    def start_manual_target(self, distance_m, angle_deg):
+        if not self._manual_mode.is_set():
+            raise ValueError('请先打开手动里程控制')
+        distance_m = float(distance_m)
+        angle_deg = float(angle_deg)
+        if (not math.isfinite(distance_m) or
+                not -5.0 <= distance_m <= 5.0):
+            raise ValueError('距离必须在 -5.0~5.0 m 之间')
+        if (not math.isfinite(angle_deg) or
+                not -360.0 <= angle_deg <= 360.0):
+            raise ValueError('角度必须在 -360~360° 之间')
+
+        pose = self.odometry.snapshot()
+        target_yaw_total = pose['odom_yaw_total_deg'] + angle_deg
+        rotate_seconds = abs(angle_deg) / 17.0
+        drive_seconds = abs(distance_m) / 0.12
+        with self._manual_lock:
+            self._manual_target = {
+                'distance_m': distance_m,
+                'angle_deg': angle_deg,
+                'target_yaw_total_deg': target_yaw_total,
+                'drive_yaw_deg': pose['odom_yaw_deg'],
+                'drive_start_x_m': pose['odom_x_m'],
+                'drive_start_y_m': pose['odom_y_m'],
+                'deadline': time.monotonic() +
+                            3.0 + 2.5 * (rotate_seconds + drive_seconds),
+            }
+            self._manual_phase = ('rotate' if abs(angle_deg) > 2.0
+                                  else 'drive')
+            self._manual_state = ('正在转向' if self._manual_phase == 'rotate'
+                                  else '正在行驶')
+            self._manual_remaining_m = abs(distance_m)
+            self._manual_remaining_deg = abs(angle_deg)
+        logger.info('手动里程目标: 距离=%+.3fm 相对角度=%+.1f°',
+                    distance_m, angle_deg)
+        return self.manual_control_status()
+
+    def cancel_manual_target(self):
+        with self._manual_lock:
+            self._manual_target = None
+            self._manual_phase = 'idle'
+            self._manual_state = ('手动模式待命' if self._manual_mode.is_set()
+                                  else '视觉循迹')
+            self._manual_remaining_m = 0.0
+            self._manual_remaining_deg = 0.0
+        self.chassis.stop()
+        logger.warning('手动里程目标已取消并停车')
+        return self.manual_control_status()
+
+    def manual_control_status(self):
+        with self._manual_lock:
+            target = dict(self._manual_target or {})
+            return {
+                'manual_mode': self._manual_mode.is_set(),
+                'manual_state': self._manual_state,
+                'manual_phase': self._manual_phase,
+                'manual_target_distance_m': target.get('distance_m', 0.0),
+                'manual_target_angle_deg': target.get('angle_deg', 0.0),
+                'manual_remaining_m': self._manual_remaining_m,
+                'manual_remaining_deg': self._manual_remaining_deg,
+            }
+
+    def _reset_tracking_state(self):
+        self._prev_err = 0.0
+        self._filtered_err = 0.0
+        self._filtered_angle = 0.0
+        self._has_prev = False
+        self._last_z = 0.0
+        self._lost_entry_z = 0.0
+        self._lost_count = 0
+        self._start_seen = 0
+        self._started = False
+        self._run_frames = 0
+        self._corner_dir = 0
+        self._corner_frames = 0
+        self._corner_phase = ''
+        self._corner_turn_radians = 0.0
+        self._corner_exit_frames = 0
+
+    def _manual_control_step(self):
+        pose = self.odometry.snapshot()
+        now = time.monotonic()
+        with self._manual_lock:
+            target = self._manual_target
+            if target is None:
+                return 'manual-idle', 0, 0
+            if now >= target['deadline']:
+                self._manual_target = None
+                self._manual_phase = 'idle'
+                self._manual_state = '目标超时，已停车'
+                self._manual_remaining_m = 0.0
+                self._manual_remaining_deg = 0.0
+                self.chassis.stop()
+                return 'manual-timeout', 0, 0
+
+            yaw_error = (target['target_yaw_total_deg'] -
+                         pose['odom_yaw_total_deg'])
+            self._manual_remaining_deg = abs(yaw_error)
+            if self._manual_phase == 'rotate':
+                # 根据当前实测角速度预留约 120ms 的制动角，防止底盘
+                # 在发出零速后仍因惯性继续转动。
+                real_z = 0.0
+                if self._last_chassis_status is not None:
+                    real_z = abs(float(
+                        self._last_chassis_status.get('real_z', 0.0)))
+                braking_deg = math.degrees(real_z * 0.12)
+                stop_tolerance = max(1.0, min(3.0, braking_deg))
+                if abs(yaw_error) <= stop_tolerance:
+                    self.chassis.send_speed(0, 0, 0)
+                    if abs(target['distance_m']) <= 0.01:
+                        self._manual_target = None
+                        self._manual_phase = 'idle'
+                        self._manual_state = '目标完成，已停车'
+                        self._manual_remaining_m = 0.0
+                        self._manual_remaining_deg = 0.0
+                        self.chassis.stop()
+                        return 'manual-complete', 0, 0
+                    # 先等待车体停稳，否则旋转惯性会带着直线阶段偏离。
+                    target['settle_until'] = now + 0.25
+                    self._manual_phase = 'settle'
+                    self._manual_state = '转向完成，等待停稳'
+                    return 'manual-transition', 0, 0
+                # 距离目标越近转得越慢；降低最小转速可显著减小越界。
+                turn_mag = min(240.0, max(55.0, abs(yaw_error) * 7.0))
+                # 世界航向左正；底盘协议 z 右正，符号相反。
+                z_speed = -int(math.copysign(turn_mag, yaw_error))
+                self._manual_state = '正在转向'
+                self.chassis.send_speed(0, 0, z_speed)
+                return 'manual-rotate', 0, z_speed
+
+            if self._manual_phase == 'settle':
+                self.chassis.send_speed(0, 0, 0)
+                if now < target['settle_until']:
+                    return 'manual-settle', 0, 0
+                target['drive_yaw_deg'] = pose['odom_yaw_deg']
+                target['drive_start_x_m'] = pose['odom_x_m']
+                target['drive_start_y_m'] = pose['odom_y_m']
+                self._manual_phase = 'drive'
+                self._manual_state = '正在行驶'
+                yaw_error = 0.0
+
+            # 用“起点到当前位置在目标航向上的投影”计算进度。
+            # 这样原地转动、横向滑动不会被误算成前进距离。
+            heading = math.radians(target['drive_yaw_deg'])
+            dx = pose['odom_x_m'] - target['drive_start_x_m']
+            dy = pose['odom_y_m'] - target['drive_start_y_m']
+            along = dx * math.cos(heading) + dy * math.sin(heading)
+            direction = 1.0 if target['distance_m'] >= 0.0 else -1.0
+            travelled = max(0.0, direction * along)
+            remaining = max(0.0, abs(target['distance_m']) - travelled)
+            self._manual_remaining_m = remaining
+            if remaining <= 0.008:
+                self._manual_target = None
+                self._manual_phase = 'idle'
+                self._manual_state = '目标完成，已停车'
+                self._manual_remaining_m = 0.0
+                self._manual_remaining_deg = 0.0
+                self.chassis.stop()
+                return 'manual-complete', 0, 0
+
+            # 在最后 24cm 内按剩余距离连续降速，减少停车越界。
+            linear_mag = min(120.0, max(30.0, remaining * 500.0))
+            x_speed = int(math.copysign(linear_mag, target['distance_m']))
+            drive_yaw_error = self._angle_error(
+                target['drive_yaw_deg'], pose['odom_yaw_deg'])
+            z_speed = int(np.clip(-drive_yaw_error * 8.0, -180.0, 180.0))
+            self._manual_state = '正在行驶'
+            self.chassis.send_speed(x_speed, 0, z_speed)
+            return 'manual-drive', x_speed, z_speed
 
     # ------------------------------------------------------------------
-    def run(self, max_frames=None):
+    def run(self, max_frames=None, stop_event=None):
         """主循环。"""
         logger.info('巡线启动: 极性=%s base=%dmm/s max_z=%dmrad/s',
                     self.detector.polarity, self.base_speed, self.max_z)
@@ -698,8 +1207,11 @@ class LineFollower:
         send_fail = 0
 
         try:
-            while True:
+            while not (stop_event and stop_event.is_set()):
                 frame = self.camera.read()
+                if stop_event and stop_event.is_set():
+                    logger.warning('收到网页急停，退出控制循环')
+                    break
                 now = time.time()
                 dt = max(now - last_t, 1e-3)
                 last_t = now
@@ -718,6 +1230,61 @@ class LineFollower:
                 err = det['error_px']
                 angle = det['angle_deg']
                 p_term = d_term = angle_term = 0.0
+
+                if self._manual_mode.is_set():
+                    chassis_status = self.chassis.read_status()
+                    if chassis_status is not None:
+                        self._last_chassis_status = chassis_status
+                        self.odometry.update(chassis_status)
+                    state, speed, z = self._manual_control_step()
+                    odometry = self.odometry.snapshot()
+                    if self.web_debug is not None:
+                        web_det = dict(det)
+                        web_det['work_width'] = self.detector.work_width
+                        web_det['crop_top_frac'] = self.detector.crop_top_frac
+                        web_det['crop_bottom_frac'] = self.detector.crop_bottom_frac
+                        self.web_debug.update(frame, web_det, {
+                            'state': state,
+                            'frame_count': frame_count,
+                            'error_px': float(err),
+                            'angle_deg': float(angle),
+                            'speed': int(speed),
+                            'turn': float(z),
+                            'p_term': 0.0,
+                            'd_term': 0.0,
+                            'angle_term': 0.0,
+                            'fps': float(self.fps),
+                            'max_z': abs(float(self.max_z)),
+                            'lost_count': self._lost_count,
+                            'no_frame_count': self._no_frame_count,
+                            'start_seen': self._start_seen,
+                            'startup_frames': self.startup_frames,
+                            'started': self._started,
+                            'binary_mode': self.detector.binary_mode,
+                            **odometry,
+                            **self.manual_control_status(),
+                        })
+                        if self.web_debug.restart_requested:
+                            logger.info('收到网页参数更新，停车后重启')
+                            break
+                    if self.debug:
+                        self._show_debug(frame, det, state, speed, z)
+                    elapsed = time.time() - now
+                    if elapsed < self.frame_interval:
+                        time.sleep(self.frame_interval - elapsed)
+                    self._fps_n += 1
+                    if time.time() - self._fps_t >= 1.0:
+                        self.fps = self._fps_n / (time.time() - self._fps_t)
+                        self._fps_n = 0
+                        self._fps_t = time.time()
+                    frame_count += 1
+                    if max_frames is not None and frame_count >= max_frames:
+                        break
+                    continue
+
+                if self._resume_tracking.is_set():
+                    self._reset_tracking_state()
+                    self._resume_tracking.clear()
 
                 detected_corner = int(det.get('corner_dir', 0))
                 if self._corner_exit_frames > 0:
@@ -948,6 +1515,12 @@ class LineFollower:
                     else:
                         state, z, speed = self._handle_lost()
 
+                chassis_status = self.chassis.read_status()
+                if chassis_status is not None:
+                    self._last_chassis_status = chassis_status
+                    self.odometry.update(chassis_status)
+                odometry = self.odometry.snapshot()
+
                 if self.web_debug is not None:
                     web_det = dict(det)
                     web_det['work_width'] = self.detector.work_width
@@ -978,6 +1551,8 @@ class LineFollower:
                         'corner_turn_target_deg': math.degrees(self.corner_turn_radians),
                         'corner_turn_speed': self.corner_turn_speed,
                         'corner_turn_deg': math.degrees(self._corner_turn_radians),
+                        **odometry,
+                        **self.manual_control_status(),
                     })
                     if self.web_debug.restart_requested:
                         logger.info('收到网页参数更新，停车后重启')
@@ -1009,7 +1584,7 @@ class LineFollower:
                         break
                     # 回读底盘状态用于显示（单位已换算）
                     real_dps = ''
-                    st = self.chassis.read_status()
+                    st = self._last_chassis_status
                     if st is not None:
                         real_dps = f" 实转z={st['real_z'] * 1000:+.0f}mrad/s"
                         real_dps += f" 实x/y={st['real_x']:+d}/{st['real_y']:+d}mm/s"

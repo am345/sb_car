@@ -28,6 +28,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 
 import serial  # 用于捕获串口连接异常
 
@@ -90,6 +91,25 @@ def main():
     parser.add_argument('--debug', action='store_true', help='显示调试窗口')
     parser.add_argument('--web', action='store_true',
                         help='启动 localhost 实时调试网页')
+    parser.add_argument('--vision-only', action='store_true',
+                        help='仅相机和 WebUI 预览，不打开底盘串口')
+    parser.add_argument('--traffic-control', action='store_true',
+                        help='启用交通标志控制（必须配合 --web；未明确指定 --speed 时静止）')
+    parser.add_argument('--sign-only', action='store_true',
+                        help='配合 --traffic-control：仅用于识别诊断，不执行支路动作')
+    parser.add_argument('--traffic-junction-advance-m', type=float, default=0.10,
+                        help='路口近端触发后至车身旋转中心的前进距离，须实测校准，默认0.10m')
+    parser.add_argument('--cross-lateral-distance-m', type=float, default=0.0,
+                        help='cross支路末端向左横移距离；0表示未配置并安全停车')
+    parser.add_argument('--cross-lateral-speed', type=int, default=100,
+                        help='cross向左横移速度mm/s，默认100')
+    parser.add_argument('--control-delay-m', type=float, default=0.10,
+                        help='循迹目标按里程延迟距离，默认0.10m')
+    preferred_model = os.path.join(_CASE_DIR, 'models', 'best_deploy.onnx')
+    if not os.path.isfile(preferred_model):
+        preferred_model = os.path.join(_CASE_DIR, 'models', 'traffic_signs.onnx')
+    parser.add_argument('--traffic-model', default=preferred_model,
+                        help='交通标志 YOLO11 ONNX 模型，传空字符串可关闭识别')
     parser.add_argument('--web-host', default='127.0.0.1',
                         help='调试网页监听地址（默认127.0.0.1）')
     parser.add_argument('--web-port', type=int, default=9090,
@@ -170,6 +190,19 @@ def main():
     if saved_config.get('binary_mode') in ('fixed', 'otsu', 'adaptive'):
         parser.set_defaults(binary_mode=saved_config['binary_mode'])
     args = parser.parse_args()
+    if args.sign_only and not args.traffic_control:
+        parser.error('--sign-only 必须与 --traffic-control 配合使用')
+    if args.traffic_control:
+        if args.vision_only or not args.web:
+            parser.error('--traffic-control 要求 --web，且不能与 --vision-only 同用')
+        if not args.traffic_model.lower().endswith('.onnx'):
+            parser.error('交通控制仅使用 CPU ONNX 模型')
+        if not 0 <= args.traffic_junction_advance_m <= 0.5:
+            parser.error('路口前进距离必须在 0~0.5 m')
+        if not any(a == '--speed' or a.startswith('--speed=') for a in sys.argv[1:]):
+            args.speed = 0  # Never inherit an old moving speed from web_config.
+        if not 0 <= args.speed <= 300:
+            parser.error('交通控制速度上限必须在 0~300 mm/s')
 
     if args.white:
         polarity = 'white'
@@ -185,6 +218,11 @@ def main():
         return
     logger.info('摄像头已打开: device=%s size=%s', camera.device, camera.actual_size)
     _set_manual_exposure(camera, args.exposure, logger)
+
+    if args.vision_only:
+        from core.vision_preview import run_preview
+        run_preview(args, camera, polarity)
+        return
 
     # 2. 底盘串口
     ports = ChassisController.list_ports()
@@ -209,6 +247,58 @@ def main():
 
     # 3. 可选的 localhost 网页调试服务
     web_debug = None
+    emergency_event = threading.Event()
+    follower_holder = {}
+
+    def emergency_stop():
+        emergency_event.set()
+        traffic_runner = follower_holder.get('traffic_runner')
+        if traffic_runner is not None:
+            # Serialize with the traffic loop's final command gate.
+            traffic_runner.trip('网页急停')
+        chassis.stop()
+
+    def reset_odometry():
+        if args.traffic_control:
+            raise RuntimeError('交通控制期间不可清零里程，请先停车退出')
+        follower = follower_holder.get('follower')
+        if follower is None:
+            raise RuntimeError('循迹控制器尚未就绪')
+        follower.reset_odometry()
+
+    def set_manual_mode(enabled):
+        if args.traffic_control:
+            raise RuntimeError('交通控制期间不可启动手动控制，请先停车退出')
+        follower = follower_holder.get('follower')
+        if follower is None:
+            raise RuntimeError('循迹控制器尚未就绪')
+        return follower.set_manual_mode(enabled)
+
+    def start_manual_target(distance_m, angle_deg):
+        if args.traffic_control:
+            raise RuntimeError('交通控制期间不可启动手动目标')
+        follower = follower_holder.get('follower')
+        if follower is None:
+            raise RuntimeError('循迹控制器尚未就绪')
+        return follower.start_manual_target(distance_m, angle_deg)
+
+    def cancel_manual_target():
+        if args.traffic_control:
+            emergency_stop()
+            return {'manual_state': '已急停'}
+        follower = follower_holder.get('follower')
+        if follower is None:
+            raise RuntimeError('循迹控制器尚未就绪')
+        return follower.cancel_manual_target()
+
+    def set_chassis_armed(enabled, speed=None):
+        if not args.traffic_control:
+            raise RuntimeError('当前不是交通控制模式')
+        traffic_runner = follower_holder.get('traffic_runner')
+        if traffic_runner is None:
+            raise RuntimeError('交通控制器尚未就绪')
+        return traffic_runner.set_armed(enabled, speed)
+
     if args.web:
         current_config = {
             name: getattr(args, name)
@@ -219,7 +309,14 @@ def main():
         web_debug = DebugWebServer(args.web_host, args.web_port,
                                    stream_fps=args.web_fps,
                                    config=current_config,
-                                   config_path=_WEB_CONFIG_PATH)
+                                   config_path=_WEB_CONFIG_PATH,
+                                   emergency_callback=emergency_stop,
+                                   reset_odometry_callback=reset_odometry,
+                                   manual_mode_callback=set_manual_mode,
+                                   manual_target_callback=start_manual_target,
+                                   manual_cancel_callback=cancel_manual_target,
+                                   traffic_model=args.traffic_model,
+                                   chassis_arm_callback=set_chassis_armed)
         try:
             web_debug.start()
         except OSError as e:
@@ -261,13 +358,25 @@ def main():
         debug=args.debug,
         web_debug=web_debug,
     )
+    follower_holder['follower'] = follower
     logger.info('极性=%s 二值化=%s 裁切(底%.2f/顶%.2f) 搜索窗=%gpx 转向取反=%s',
                 polarity, args.binary_mode, args.crop_bottom, args.crop_top, args.track_half,
                 not args.no_z_invert)
 
     restart_requested = False
     try:
-        follower.run(max_frames=args.max_frames)
+        if args.traffic_control:
+            from core.traffic_control import TrafficControlRunner
+            runner = TrafficControlRunner(follower, args.traffic_junction_advance_m,
+                                          sign_only=args.sign_only,
+                                          cross_lateral_distance_m=args.cross_lateral_distance_m,
+                                          cross_lateral_speed=args.cross_lateral_speed,
+                                          control_delay_m=args.control_delay_m)
+            follower_holder['traffic_runner'] = runner
+            runner.run(max_frames=args.max_frames, stop_event=emergency_event)
+        else:
+            follower.run(max_frames=args.max_frames,
+                         stop_event=emergency_event)
     finally:
         restart_requested = bool(web_debug and web_debug.restart_requested)
         if web_debug is not None:
@@ -277,12 +386,16 @@ def main():
         logger.info('04 巡线程序退出，串口 %s 已释放', ch_port)
 
     if restart_requested:
+        if args.traffic_control:
+            logger.warning('交通参数已保存并停车；请重新以 --speed 0 验证，不自动恢复运动')
+            return
         logger.info('正在使用网页保存的参数重启')
         os.execv(sys.executable, [
             sys.executable, os.path.abspath(__file__),
             '--web', '--web-host', args.web_host,
             '--web-port', str(args.web_port),
             '--web-fps', str(args.web_fps),
+            '--traffic-model', args.traffic_model,
         ])
 
 

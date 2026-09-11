@@ -4,3 +4,28 @@ __pycache__/
 *.tmp
 *:Zone.Identifier
 image_logs/
+
+# Local experiment outputs and scratch workspace
+/artifacts/
+/outputs/
+/tmp/
+/work/
+
+# Models, datasets, archives and captured media are release artifacts, not source
+*.pt
+*.onnx
+*.rknn
+*.zip
+*.tar
+*.tar.gz
+*.mp4
+*.avi
+*.bin
+
+# Webots generated reports and camera captures
+/webots_line_follow_prototype/*.json
+/webots_line_follow_prototype/*.jpg
+/webots_line_follow_prototype/camera_*/
+/webots_line_follow_prototype/*_frames/
+/webots_line_follow_prototype/smart_car_*/
+!/webots_line_follow_prototype/SOURCE_VERSION.json

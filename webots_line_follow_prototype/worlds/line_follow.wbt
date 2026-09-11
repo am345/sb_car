@@ -1,0 +1,83 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "../protos/SmartMecanum.proto"
+EXTERNPROTO "../protos/ComplexCompetitionTrack.proto"
+
+WorldInfo {
+  basicTimeStep 10
+  coordinateSystem "ENU"
+  contactProperties [
+    ContactProperties {
+      material1 "InteriorWheelMat"
+      coulombFriction [ 0, 2, 0 ]
+      frictionRotation -0.785398 0
+      forceDependentSlip [ 10, 0 ]
+      softCFM 0.0001
+    }
+    ContactProperties {
+      material1 "ExteriorWheelMat"
+      coulombFriction [ 0, 2, 0 ]
+      frictionRotation 0.785398 0
+      forceDependentSlip [ 10, 0 ]
+      softCFM 0.0001
+    }
+  ]
+}
+Viewpoint {
+  orientation 0 1 0 1.57079632679
+  position 0 0 10.5
+}
+TexturedBackground { }
+TexturedBackgroundLight { }
+
+Solid {
+  translation 0 0 -0.015
+  name "floor"
+  contactMaterial "floor"
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.83 0.83 0.80
+        roughness 0.9
+      }
+      geometry Box { size 8 8 0.03 }
+    }
+  ]
+  boundingObject Box { size 8 8 0.03 }
+}
+
+ComplexCompetitionTrack { }
+
+SmartMecanum {
+  translation -0.45 -2.92 0.04
+  rotation 0 0 1 -3.06
+  name "smart_car_sim"
+  controller "line_follow_sim"
+  supervisor TRUE
+  bodySlot [
+    Transform {
+      translation 0.09 0 0.095
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.05 0.25 0.55
+            metalness 0.15
+            roughness 0.35
+          }
+          geometry Box { size 0.06 0.05 0.03 }
+        }
+      ]
+    }
+    Camera {
+      translation 0.115 0 0.10
+      rotation 0 1 0 0.14
+      name "camera"
+      fieldOfView 1.57079632679
+      width 640
+      height 480
+      near 0.01
+    }
+  ]
+}
