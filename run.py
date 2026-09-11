@@ -55,6 +55,7 @@ REAL_CAMERA_HFOV_DEG = 100.0
 REAL_CAMERA_HEIGHT_M = 0.23
 REAL_CAMERA_PITCH_DEG = 8.0
 REAL_CAMERA_FORWARD_M = 0.32
+REAL_CHASSIS_Z_INVERT = False
 
 
 def _load_web_config(logger):
@@ -156,8 +157,11 @@ def main():
                         help='adaptive 模式的局部窗口边长(奇数且>=3)')
     parser.add_argument('--adaptive-c', type=float, default=8.0,
                         help='adaptive 模式的局部均值修正常数')
-    parser.add_argument('--no-z-invert', action='store_true',
-                        help='转向方向不取反（默认取反）')
+    parser.add_argument('--z-invert', dest='z_invert', action='store_true',
+                        default=REAL_CHASSIS_Z_INVERT,
+                        help='反转底盘转向符号（仅用于协议方向相反的硬件）')
+    parser.add_argument('--no-z-invert', dest='z_invert', action='store_false',
+                        help=argparse.SUPPRESS)
     parser.add_argument('--kp', type=float, default=12.0, help='横向误差比例增益(配合max_z=800)')
     parser.add_argument('--kd', type=float, default=1.2, help='横向误差微分增益')
     parser.add_argument('--ka', type=float, default=3.5, help='方向角前馈增益')
@@ -376,7 +380,7 @@ def main():
         fixed_threshold=args.threshold,
         adaptive_block=args.adaptive_block,
         adaptive_c=args.adaptive_c,
-        z_invert=not args.no_z_invert,   # 转向方向取反（默认 True）
+        z_invert=args.z_invert,
         debug=args.debug,
         web_debug=web_debug,
         trajectory_geometry=memory_geometry,
@@ -384,7 +388,7 @@ def main():
     follower_holder['follower'] = follower
     logger.info('极性=%s 二值化=%s 裁切(底%.2f/顶%.2f) 搜索窗=%gpx 转向取反=%s',
                 polarity, args.binary_mode, args.crop_bottom, args.crop_top, args.track_half,
-                not args.no_z_invert)
+                args.z_invert)
     logger.info('轨迹记忆已启用: HFOV=%.1f° 高度=%.3fm 俯角=%.2f° 前移=%.3fm',
                 args.camera_hfov_deg, args.camera_height_m,
                 args.camera_pitch_deg, args.camera_forward_m)

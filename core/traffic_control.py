@@ -127,7 +127,7 @@ class TrafficControlRunner:
         if self.policy.locked_branch is not None:
             return self.policy.locked_branch
         if self.policy.state in (
-                'driving', 'memorized', 'roadblock-memorized',
+                'memorized', 'roadblock-memorized',
                 'people-crossing', 'cross-follow', 'junction-wait'):
             return 'continuation'
         return None

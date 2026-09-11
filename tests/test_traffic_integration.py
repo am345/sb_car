@@ -15,6 +15,7 @@ import numpy as np
 from core.line_follower import LineDetector, LineFollower
 from core.traffic_control import TrafficControlRunner
 from debug_web import CONFIG_SCHEMA, DebugWebServer
+from run import REAL_CHASSIS_Z_INVERT
 
 
 class IntegrationTests(unittest.TestCase):
@@ -293,6 +294,42 @@ class IntegrationTests(unittest.TestCase):
             'selected_branch_direction': 'right'}, .1)
         self.assertEqual(abs(command[2]), 800)
 
+    def test_real_chassis_turns_right_for_a_line_on_the_right(self):
+        follower = SimpleNamespace(
+            base_speed=100, max_z=800, kp=12.0, kd=0.0, ka=3.5,
+            err_alpha=1.0, z_rate_limit=800,
+            z_invert=REAL_CHASSIS_Z_INVERT)
+        runner = TrafficControlRunner(follower, control_delay_m=0)
+        command = runner._tracking({
+            'is_valid': True, 'error_px': 23.4, 'angle_deg': -10.4,
+            'path_curvature': 0.0,
+            'selected_branch_direction': None}, .05)
+
+        # The physical protocol defines positive z as a right turn.
+        self.assertGreater(command[2], 0)
+
+    def test_shifted_right_path_does_not_get_left_curvature_feedforward(self):
+        frame = np.full((480, 640, 3), 225, np.uint8)
+        cv2.line(frame, (360, 479), (330, 290), (0, 0, 0), 36)
+        cv2.line(frame, (330, 290), (600, 290), (0, 0, 0), 30)
+        detector = LineDetector(
+            roi_top_ratio=.7, crop_bottom_frac=.4,
+            crop_top_frac=.6, track_half=60,
+            scan_start_ratio=.25, binary_mode='otsu', n_scan_rows=12)
+        follower = SimpleNamespace(
+            base_speed=100, max_z=800, kp=12.0, kd=0.0, ka=3.5,
+            err_alpha=1.0, z_rate_limit=800,
+            z_invert=REAL_CHASSIS_Z_INVERT)
+        runner = TrafficControlRunner(follower, control_delay_m=0)
+        runner.policy.state = 'driving'
+        detector.path_preference = runner._detector_path_preference()
+
+        detection = detector.process(frame)
+        command = runner._tracking(detection, .05)
+
+        self.assertGreater(detection['error_px'], 0)
+        self.assertGreater(command[2], 0)
+
     def test_tracking_targets_are_delayed_by_odometry_not_frames(self):
         follower = SimpleNamespace(
             base_speed=300, max_z=800, kp=12.0, kd=0.0, ka=0.0,
@@ -367,7 +404,9 @@ class IntegrationTests(unittest.TestCase):
 
     def test_line_following_states_trace_from_near_connected_line(self):
         runner = self.runner()
-        for state in ('driving', 'roadblock-memorized',
+        runner.policy.state = 'driving'
+        self.assertIsNone(runner._detector_path_preference())
+        for state in ('roadblock-memorized',
                       'people-crossing', 'cross-follow', 'junction-wait',
                       ):
             runner.policy.state = state

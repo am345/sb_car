@@ -214,9 +214,14 @@ class LineDetector:
                 forward_px = max(1.0, near_y - target_y)
                 angle_deg = math.degrees(math.atan2(
                     target_x - near_x, forward_px))
-                chord_sq = ((target_x - near_x) ** 2 +
-                            (target_y - near_y) ** 2)
-                path_curvature = (2.0 * (target_x - near_x) /
+                # Pure Pursuit is defined from the vehicle reference point,
+                # not from the first visible path point.  The old
+                # target_x-near_x term could command left while the complete
+                # visible target was still on the vehicle's right.
+                target_lateral = target_x - center
+                target_forward = max(1.0, (roi_h - 1.0) - target_y)
+                chord_sq = (target_lateral ** 2 + target_forward ** 2)
+                path_curvature = (2.0 * target_lateral /
                                   max(1.0, chord_sq))
                 self._prev_cx = (float(near_x) if self._prev_cx is None else
                                  0.6 * float(near_x) + 0.4 * self._prev_cx)
