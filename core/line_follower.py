@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 
 from core.odometry import ImuOdometry
+from core.trajectory_memory import GroundProjector, TrajectoryMemory
 
 logger = logging.getLogger(__name__)
 
@@ -1060,7 +1061,8 @@ class LineFollower:
                  binary_mode='otsu', fixed_threshold=100,
                  adaptive_block=31, adaptive_c=8.0,
                  z_invert=True,   # 转向方向取反（默认 True）
-                 target_fps=20, debug=False, web_debug=None):
+                 target_fps=20, debug=False, web_debug=None,
+                 trajectory_geometry=None):
         self.camera = camera
         self.chassis = chassis
         self.base_speed = base_speed
@@ -1106,6 +1108,11 @@ class LineFollower:
         self._fps_t = time.time()
         self.odometry = ImuOdometry()
         self._last_chassis_status = None
+        self.trajectory_memory = None
+        self.ground_projector = None
+        if trajectory_geometry is not None:
+            self.ground_projector = GroundProjector(**trajectory_geometry)
+            self.trajectory_memory = TrajectoryMemory()
         self._manual_mode = threading.Event()
         self._resume_tracking = threading.Event()
         self._manual_lock = threading.Lock()
@@ -1117,6 +1124,8 @@ class LineFollower:
 
     def reset_odometry(self):
         self.odometry.reset()
+        if self.trajectory_memory is not None:
+            self.trajectory_memory.reset()
         logger.info('IMU 里程计已清零')
 
     @staticmethod
@@ -1221,6 +1230,33 @@ class LineFollower:
         self._start_seen = 0
         self._started = False
         self._run_frames = 0
+        if self.trajectory_memory is not None:
+            self.trajectory_memory.reset()
+
+    def _apply_trajectory_memory(self, detection, pose):
+        """Record visible slopes or recall the next slope through a blind zone."""
+        if self.trajectory_memory is None or self.ground_projector is None:
+            return detection, None
+        if detection.get('is_valid'):
+            points = detection.get('path_points') or detection.get('points') or []
+            self.trajectory_memory.observe_pixels(
+                points, pose, self.ground_projector)
+            return detection, None
+        cue = self.trajectory_memory.recall(pose)
+        if cue is None:
+            return detection, None
+        bearing = math.degrees(math.atan2(
+            cue['target_right_m'], cue['target_forward_m']))
+        result = dict(detection)
+        result.update({
+            'is_valid': True,
+            'memory_active': True,
+            'memory_remaining_points': cue['remaining_points'],
+            'error_px': (bearing / max(1e-6, self.ground_projector.hfov_deg/2) *
+                         self.detector.work_width/2),
+            'angle_deg': cue['heading_error_deg'],
+        })
+        return result, cue
 
     def _manual_control_step(self):
         pose = self.odometry.snapshot()
@@ -1346,17 +1382,23 @@ class LineFollower:
                     self._no_frame_count = 0
 
                 det = self.detector.process(frame)
+                chassis_status = self.chassis.read_status()
+                if chassis_status is not None:
+                    self._last_chassis_status = chassis_status
+                    self.odometry.update(
+                        chassis_status,
+                        timestamp=chassis_status.get('_timestamp'))
+                odometry = self.odometry.snapshot()
+                memory_cue = None
+                if chassis_status is not None:
+                    det, memory_cue = self._apply_trajectory_memory(
+                        det, odometry)
                 err = det['error_px']
                 angle = det['angle_deg']
                 p_term = d_term = angle_term = curvature_term = 0.0
 
                 if self._manual_mode.is_set():
-                    chassis_status = self.chassis.read_status()
-                    if chassis_status is not None:
-                        self._last_chassis_status = chassis_status
-                        self.odometry.update(chassis_status)
                     state, speed, z = self._manual_control_step()
-                    odometry = self.odometry.snapshot()
                     if self.web_debug is not None:
                         web_det = dict(det)
                         web_det['work_width'] = self.detector.work_width
@@ -1411,7 +1453,7 @@ class LineFollower:
                 # but it must not replace steering with a terrain-specific
                 # advance-then-rotate state machine.
                 if det['is_valid']:
-                    state = 'run'
+                    state = 'run-memory' if memory_cue is not None else 'run'
                     self._lost_count = 0
                     self._last_sign = 1 if err >= 0 else -1
 
@@ -1504,6 +1546,10 @@ class LineFollower:
                             curvature_scale = float(np.clip(
                                 radius_px / 110.0, 0.22, 1.0))
                             curve_scale = min(curve_scale, curvature_scale)
+                        if memory_cue is not None:
+                            heading_scale = max(0.0, math.cos(math.radians(
+                                abs(memory_cue['heading_error_deg']))))
+                            curve_scale = min(curve_scale, heading_scale)
                         speed = int(round(self.base_speed * ramp * curve_scale))
                         if abs(err) > 40:
                             speed = min(speed, int(round(self.base_speed * 0.3)))
@@ -1525,12 +1571,6 @@ class LineFollower:
                         self.chassis.send_speed(0, 0, 0)
                     else:
                         state, z, speed = self._handle_lost()
-
-                chassis_status = self.chassis.read_status()
-                if chassis_status is not None:
-                    self._last_chassis_status = chassis_status
-                    self.odometry.update(chassis_status)
-                odometry = self.odometry.snapshot()
 
                 if self.web_debug is not None:
                     web_det = dict(det)

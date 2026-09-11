@@ -46,7 +46,8 @@ logging.basicConfig(
 def verify_production_source():
     """Record the repository sources used by this simulation run."""
     actual = {}
-    for relative_path in ("core/line_follower.py", "core/odometry.py"):
+    for relative_path in ("core/line_follower.py", "core/odometry.py",
+                          "core/trajectory_memory.py"):
         path = PRODUCTION_ROOT / relative_path
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         actual[relative_path] = digest
@@ -88,6 +89,8 @@ class WebotsMecanumChassis:
     """Translate real chassis command units into four-wheel mecanum IK."""
 
     def __init__(self, robot):
+        self.robot = robot
+        self.self_node = robot.getSelf()
         self.motors = {
             "front_left": robot.getDevice("front_left_wheel_joint"),
             "front_right": robot.getDevice("front_right_wheel_joint"),
@@ -100,6 +103,13 @@ class WebotsMecanumChassis:
         self.last_command = {"x_mm_s": 0, "y_mm_s": 0, "z_mrad_s": 0}
         self.last_wheels = {name: 0.0 for name in self.motors}
         self.halted = False
+        self.feedback_time = robot.getTime()
+        self.feedback_position = self.self_node.getPosition()
+        self.feedback_yaw = self._yaw()
+
+    def _yaw(self):
+        orientation = self.self_node.getOrientation()
+        return math.atan2(orientation[3], orientation[0])
 
     def send_speed(self, x, y, z):
         if self.halted:
@@ -125,9 +135,26 @@ class WebotsMecanumChassis:
         return True
 
     def read_status(self):
-        # The first prototype stage validates vision/control commands only.
-        # Simulated encoder/IMU feedback belongs in the dynamics stage.
-        return None
+        now = self.robot.getTime()
+        position = self.self_node.getPosition()
+        yaw = self._yaw()
+        dt = now - self.feedback_time
+        if dt <= 0:
+            return {'real_x': 0, 'real_y': 0, 'real_z': 0.0,
+                    'ang_vel_z': 0, '_timestamp': now}
+        world_x = (position[0] - self.feedback_position[0]) / dt
+        world_y = (position[1] - self.feedback_position[1]) / dt
+        body_x = world_x * math.cos(yaw) + world_y * math.sin(yaw)
+        body_y = -world_x * math.sin(yaw) + world_y * math.cos(yaw)
+        yaw_delta = math.atan2(math.sin(yaw - self.feedback_yaw),
+                               math.cos(yaw - self.feedback_yaw))
+        self.feedback_time = now
+        self.feedback_position = position
+        self.feedback_yaw = yaw
+        return {'real_x': int(round(body_x * 1000)),
+                'real_y': int(round(body_y * 1000)),
+                'real_z': -yaw_delta / dt,
+                'ang_vel_z': 0, '_timestamp': now}
 
     def stop(self):
         self.send_speed(0, 0, 0)
@@ -359,6 +386,14 @@ follower = LineFollower(
     # 20 Hz limiter then keeps simulated time and wall time approximately 1:1.
     target_fps=20,
     web_debug=output,
+    trajectory_geometry={
+        'image_width': 320,
+        'image_height': 240,
+        'horizontal_fov_deg': 90.0,
+        'camera_height_m': 0.14,
+        'pitch_down_deg': math.degrees(0.14),
+        'camera_forward_m': 0.115,
+    },
 )
 follower_holder["follower"] = follower
 

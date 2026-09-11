@@ -1,16 +1,16 @@
 #VRML_SIM R2025a utf8
 
-# 30 mm wide, single-route complex track based on the competition map topology.
-# Scale is provisional because the source PDF provides no physical dimensions.
+# 30 mm single-route track with exact right-angle bends and a crossroad.
+# Generated main centreline length: 36.614 m.
 PROTO ComplexCompetitionTrack [
 ]
 {
   Group {
     children [
       Transform {
-        translation -0.650000 -2.925000 0.013000
+        translation -0.228125 -2.901562 0.013000
         rotation 0 0 1 -3.086094
-        scale 0.233347 0.030000 0.002000
+        scale 0.064337 0.030000 0.002000
         children [
           DEF TRACK_SEGMENT Shape {
             appearance PBRAppearance {
@@ -19,6 +19,30 @@ PROTO ComplexCompetitionTrack [
             }
             geometry Box { size 1 1 1 }
           }
+        ]
+      }
+      Transform {
+        translation -0.312500 -2.906250 0.013000
+        rotation 0 0 1 -3.086094
+        scale 0.120673 0.030000 0.002000
+        children [
+          USE TRACK_SEGMENT
+        ]
+      }
+      Transform {
+        translation -0.453125 -2.914062 0.013000
+        rotation 0 0 1 -3.086094
+        scale 0.177010 0.030000 0.002000
+        children [
+          USE TRACK_SEGMENT
+        ]
+      }
+      Transform {
+        translation -0.650000 -2.925000 0.013000
+        rotation 0 0 1 -3.086094
+        scale 0.233347 0.030000 0.002000
+        children [
+          USE TRACK_SEGMENT
         ]
       }
       Transform {
@@ -374,7 +398,7 @@ PROTO ComplexCompetitionTrack [
         ]
       }
       Transform {
-        translation -1.132813 1.706875 0.013000
+        translation -1.132812 1.706875 0.013000
         rotation 0 0 1 -1.445556
         scale 0.183122 0.030000 0.002000
         children [
@@ -406,7 +430,7 @@ PROTO ComplexCompetitionTrack [
         ]
       }
       Transform {
-        translation -1.351563 0.927187 0.013000
+        translation -1.351562 0.927187 0.013000
         rotation 0 0 1 -2.030834
         scale 0.240273 0.030000 0.002000
         children [
@@ -470,7 +494,7 @@ PROTO ComplexCompetitionTrack [
         ]
       }
       Transform {
-        translation -1.632813 -0.565625 0.013000
+        translation -1.632812 -0.565625 0.013000
         rotation 0 0 1 -0.969637
         scale 0.179279 0.030000 0.002000
         children [
@@ -1366,313 +1390,273 @@ PROTO ComplexCompetitionTrack [
         ]
       }
       Transform {
-        translation 2.526250 0.599375 0.013000
-        rotation 0 0 1 -0.093477
-        scale 0.128526 0.030000 0.002000
+        translation 2.512188 0.608750 0.013000
+        rotation 0 0 1 0.081452
+        scale 0.100181 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.645000 0.577500 0.013000
-        rotation 0 0 1 -0.269849
-        scale 0.129912 0.030000 0.002000
+        translation 2.588750 0.615000 0.013000
+        rotation 0 0 1 0.081452
+        scale 0.069454 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.761250 0.534375 0.013000
-        rotation 0 0 1 -0.437222
-        scale 0.134941 0.030000 0.002000
+        translation 2.634688 0.618750 0.013000
+        rotation 0 0 1 0.081452
+        scale 0.038727 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.875000 0.470000 0.013000
-        rotation 0 0 1 -0.588003
-        scale 0.143208 0.030000 0.002000
+        translation 3.100000 0.620000 0.013000
+        rotation 0 0 1 0.000000
+        scale 0.908000 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.979062 0.387500 0.013000
-        rotation 0 0 1 -0.755104
-        scale 0.139317 0.030000 0.002000
+        translation 3.550000 0.035000 0.013000
+        rotation 0 0 1 -1.570796
+        scale 1.178000 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.066250 0.290000 0.013000
-        rotation 0 0 1 -0.927295
-        scale 0.139250 0.030000 0.002000
+        translation 3.125000 -0.550000 0.013000
+        rotation 0 0 1 3.141593
+        scale 0.858000 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.136563 0.177500 0.013000
-        rotation 0 0 1 -1.094727
-        scale 0.143013 0.030000 0.002000
+        translation 2.700000 -1.050000 0.013000
+        rotation 0 0 1 -1.570796
+        scale 1.008000 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.190000 0.050000 0.013000
-        rotation 0 0 1 -1.249046
-        scale 0.150302 0.030000 0.002000
+        translation 2.704688 -1.558438 0.013000
+        rotation 0 0 1 -1.063698
+        scale 0.027304 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.222500 -0.096250 0.013000
-        rotation 0 0 1 -1.444488
-        scale 0.166765 0.030000 0.002000
+        translation 2.718750 -1.583750 0.013000
+        rotation 0 0 1 -1.063698
+        scale 0.046609 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.230000 -0.265000 0.013000
-        rotation 0 0 1 -1.598567
-        scale 0.188069 0.030000 0.002000
+        translation 2.742188 -1.625938 0.013000
+        rotation 0 0 1 -1.063698
+        scale 0.065913 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.212500 -0.456250 0.013000
-        rotation 0 0 1 -1.717875
-        scale 0.212710 0.030000 0.002000
+        translation 2.775000 -1.685000 0.013000
+        rotation 0 0 1 -1.063698
+        scale 0.085217 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.170000 -0.670000 0.013000
-        rotation 0 0 1 -1.810539
-        scale 0.239625 0.030000 0.002000
+        translation 2.818750 -1.751250 0.013000
+        rotation 0 0 1 -0.915101
+        scale 0.090006 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.110000 -0.878125 0.013000
-        rotation 0 0 1 -1.898418
-        scale 0.209994 0.030000 0.002000
+        translation 2.875000 -1.815000 0.013000
+        rotation 0 0 1 -0.785398
+        scale 0.096388 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.040000 -1.052500 0.013000
-        rotation 0 0 1 -2.015216
-        scale 0.182446 0.030000 0.002000
+        translation 2.943750 -1.876250 0.013000
+        rotation 0 0 1 -0.674741
+        scale 0.104047 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.960000 -1.193125 0.013000
-        rotation 0 0 1 -2.172655
-        scale 0.158130 0.030000 0.002000
+        translation 3.025000 -1.935000 0.013000
+        rotation 0 0 1 -0.581380
+        scale 0.112702 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.870000 -1.300000 0.013000
-        rotation 0 0 1 -2.383215
-        scale 0.138863 0.030000 0.002000
+        translation 3.086563 -1.993750 0.013000
+        rotation 0 0 1 -1.034985
+        scale 0.077779 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.802500 -1.388750 0.013000
-        rotation 0 0 1 -1.999574
-        scale 0.104209 0.030000 0.002000
+        translation 3.096250 -2.055000 0.013000
+        rotation 0 0 1 -1.825164
+        scale 0.072578 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.790000 -1.475000 0.013000
-        rotation 0 0 1 -1.396124
-        scale 0.094313 0.030000 0.002000
+        translation 3.054063 -2.118750 0.013000
+        rotation 0 0 1 -2.379664
+        scale 0.102160 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.832500 -1.558750 0.013000
-        rotation 0 0 1 -0.867183
-        scale 0.116195 0.030000 0.002000
+        translation 2.960000 -2.185000 0.013000
+        rotation 0 0 1 -2.629203
+        scale 0.145682 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.930000 -1.640000 0.013000
-        rotation 0 0 1 -0.569313
-        scale 0.156408 0.030000 0.002000
+        translation 2.866875 -2.251250 0.013000
+        rotation 0 0 1 -2.365718
+        scale 0.100812 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.024375 -1.720000 0.013000
-        rotation 0 0 1 -0.897964
-        scale 0.110294 0.030000 0.002000
+        translation 2.827500 -2.315000 0.013000
+        rotation 0 0 1 -1.768192
+        scale 0.071738 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.057500 -1.800000 0.013000
-        rotation 0 0 1 -1.539556
-        scale 0.088039 0.030000 0.002000
+        translation 2.841875 -2.376250 0.013000
+        rotation 0 0 1 -0.968509
+        scale 0.080812 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.029375 -1.880000 0.013000
-        rotation 0 0 1 -2.204222
-        scale 0.107255 0.030000 0.002000
+        translation 2.910000 -2.435000 0.013000
+        rotation 0 0 1 -0.544280
+        scale 0.119046 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.940000 -1.960000 0.013000
-        rotation 0 0 1 -2.553590
-        scale 0.152222 0.030000 0.002000
+        translation 2.977500 -2.490625 0.013000
+        rotation 0 0 1 -0.931027
+        scale 0.075000 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.848750 -2.040312 0.013000
-        rotation 0 0 1 -2.230227
-        scale 0.110013 0.030000 0.002000
+        translation 2.990000 -2.542500 0.013000
+        rotation 0 0 1 -1.862253
+        scale 0.060202 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.815000 -2.121250 0.013000
-        rotation 0 0 1 -1.632257
-        scale 0.089404 0.030000 0.002000
+        translation 2.947500 -2.590625 0.013000
+        rotation 0 0 1 -2.557722
+        scale 0.091899 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.838750 -2.202813 0.013000
-        rotation 0 0 1 -1.000617
-        scale 0.105261 0.030000 0.002000
+        translation 2.850000 -2.635000 0.013000
+        rotation 0 0 1 -2.813854
+        scale 0.140027 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.920000 -2.285000 0.013000
-        rotation 0 0 1 -0.643501
-        scale 0.145500 0.030000 0.002000
+        translation 2.715625 -2.675312 0.013000
+        rotation 0 0 1 -2.882344
+        scale 0.156720 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.001875 -2.365625 0.013000
-        rotation 0 0 1 -0.971885
-        scale 0.103345 0.030000 0.002000
+        translation 2.562500 -2.711250 0.013000
+        rotation 0 0 1 -2.936812
+        scale 0.173968 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 3.027500 -2.442500 0.013000
-        rotation 0 0 1 -1.604117
-        scale 0.083042 0.030000 0.002000
+        translation 2.390625 -2.742812 0.013000
+        rotation 0 0 1 -2.980921
+        scale 0.191615 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.996875 -2.515625 0.013000
-        rotation 0 0 1 -2.260335
-        scale 0.100348 0.030000 0.002000
+        translation 2.200000 -2.770000 0.013000
+        rotation 0 0 1 -3.017238
+        scale 0.209556 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.910000 -2.585000 0.013000
-        rotation 0 0 1 -2.610819
-        scale 0.141346 0.030000 0.002000
+        translation 1.994375 -2.791875 0.013000
+        rotation 0 0 1 -3.053067
+        scale 0.220080 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.781875 -2.647188 0.013000
-        rotation 0 0 1 -2.758800
-        scale 0.160271 0.030000 0.002000
+        translation 1.777500 -2.807500 0.013000
+        rotation 0 0 1 -3.085472
+        scale 0.230851 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 2.627500 -2.698750 0.013000
-        rotation 0 0 1 -2.872186
-        scale 0.181768 0.030000 0.002000
-        children [
-          USE TRACK_SEGMENT
-        ]
-      }
-      Transform {
-        translation 2.446875 -2.739687 0.013000
-        rotation 0 0 1 -2.959753
-        scale 0.204998 0.030000 0.002000
-        children [
-          USE TRACK_SEGMENT
-        ]
-      }
-      Transform {
-        translation 2.240000 -2.770000 0.013000
-        rotation 0 0 1 -3.028442
-        scale 0.229416 0.030000 0.002000
-        children [
-          USE TRACK_SEGMENT
-        ]
-      }
-      Transform {
-        translation 2.016875 -2.791875 0.013000
-        rotation 0 0 1 -3.058909
-        scale 0.235026 0.030000 0.002000
-        children [
-          USE TRACK_SEGMENT
-        ]
-      }
-      Transform {
-        translation 1.787500 -2.807500 0.013000
-        rotation 0 0 1 -3.087881
-        scale 0.240836 0.030000 0.002000
-        children [
-          USE TRACK_SEGMENT
-        ]
-      }
-      Transform {
-        translation 1.551875 -2.816875 0.013000
-        rotation 0 0 1 -3.115421
-        scale 0.246832 0.030000 0.002000
+        translation 1.549375 -2.816875 0.013000
+        rotation 0 0 1 -3.114861
+        scale 0.241834 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
@@ -1686,25 +1670,25 @@ PROTO ComplexCompetitionTrack [
         ]
       }
       Transform {
-        translation 1.063750 -2.822500 0.013000
-        rotation 0 0 1 -3.121393
-        scale 0.255550 0.030000 0.002000
+        translation 1.095625 -2.820000 0.013000
+        rotation 0 0 1 3.141593
+        scale 0.191750 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 0.815000 -2.830000 0.013000
-        rotation 0 0 1 -3.101614
-        scale 0.258200 0.030000 0.002000
+        translation 0.942500 -2.820000 0.013000
+        rotation 0 0 1 3.141593
+        scale 0.130500 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 0.563750 -2.842500 0.013000
-        rotation 0 0 1 -3.082256
-        scale 0.260945 0.030000 0.002000
+        translation 0.850625 -2.820000 0.013000
+        rotation 0 0 1 3.141593
+        scale 0.069250 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
@@ -1712,31 +1696,15 @@ PROTO ComplexCompetitionTrack [
       Transform {
         translation 0.310000 -2.860000 0.013000
         rotation 0 0 1 -3.063322
-        scale 0.263783 0.030000 0.002000
+        scale 1.031132 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
       }
       Transform {
-        translation 0.058750 -2.879062 0.013000
-        rotation 0 0 1 -3.068491
-        scale 0.256163 0.030000 0.002000
-        children [
-          USE TRACK_SEGMENT
-        ]
-      }
-      Transform {
-        translation -0.185000 -2.896250 0.013000
-        rotation 0 0 1 -3.073988
-        scale 0.248550 0.030000 0.002000
-        children [
-          USE TRACK_SEGMENT
-        ]
-      }
-      Transform {
-        translation -0.421250 -2.911562 0.013000
-        rotation 0 0 1 -3.079843
-        scale 0.240944 0.030000 0.002000
+        translation 0.300000 -2.865000 0.013000
+        rotation 0 0 1 1.570796
+        scale 1.178000 0.030000 0.002000
         children [
           USE TRACK_SEGMENT
         ]
@@ -1744,4 +1712,3 @@ PROTO ComplexCompetitionTrack [
     ]
   }
 }
-
