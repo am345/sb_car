@@ -161,6 +161,38 @@ class IntegrationTests(unittest.TestCase):
         self.assertFalse(result['is_valid'])
         self.assertEqual(result['corner_dir'], 0)
 
+    def test_real_width_calibration_accepts_only_30_to_60_mm_tape(self):
+        model = {
+            'horizontal_fov_deg': 100, 'camera_height_m': .23,
+            'pitch_down_deg': 8, 'segmentation_scale': 1.8,
+            'min_width_mm': 30, 'max_width_mm': 60,
+        }
+
+        def detect(width_factor):
+            frame = np.full((480, 640, 3), 225, np.uint8)
+            ys = np.arange(320, 480)
+            progress = (ys-320)/159.0
+            centers = 290+30*progress+8*np.sin(progress*np.pi)
+            widths = (14+16*progress)*width_factor
+            left = np.column_stack((centers-widths/2, ys))
+            right = np.column_stack((centers+widths/2, ys))[::-1]
+            polygon = np.rint(np.vstack((left, right))).astype(np.int32)
+            cv2.fillPoly(frame, [polygon], (0, 0, 0))
+            detector = LineDetector(
+                roi_top_ratio=.6, crop_bottom_frac=.5,
+                crop_top_frac=.7, track_half=80, binary_mode='otsu',
+                line_width_model=model)
+            return detector.process(frame)
+
+        too_small = detect(.45)
+        nominal = detect(1.0)
+        too_large = detect(1.8)
+
+        self.assertFalse(too_small['is_valid'])
+        self.assertTrue(nominal['is_valid'])
+        self.assertAlmostEqual(nominal['line_width_mm'], 50, delta=3)
+        self.assertFalse(too_large['is_valid'])
+
     def test_branch_candidates_keep_relative_direction_ids(self):
         corner = {'corner_point': (160, 150), 'corner_span': 180,
                   'junction_left': True, 'junction_straight': True,

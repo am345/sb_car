@@ -45,6 +45,18 @@ from debug_web import CONFIG_SCHEMA, DebugWebServer
 
 _WEB_CONFIG_PATH = os.path.join(_CASE_DIR, 'web_config.json')
 
+# Real-camera width calibration.  Otsu retains about 1/1.8 of the physical
+# tape width on the saved 40-50 mm reference line, so compensate before
+# applying the requested 30-60 mm acceptance range.
+REAL_LINE_WIDTH_MODEL = {
+    'horizontal_fov_deg': 100.0,
+    'camera_height_m': 0.23,
+    'pitch_down_deg': 8.0,
+    'segmentation_scale': 1.8,
+    'min_width_mm': 30.0,
+    'max_width_mm': 60.0,
+}
+
 
 def _load_web_config(logger):
     try:
@@ -357,11 +369,16 @@ def main():
         z_invert=not args.no_z_invert,   # 转向方向取反（默认 True）
         debug=args.debug,
         web_debug=web_debug,
+        line_width_model=REAL_LINE_WIDTH_MODEL,
     )
     follower_holder['follower'] = follower
     logger.info('极性=%s 二值化=%s 裁切(底%.2f/顶%.2f) 搜索窗=%gpx 转向取反=%s',
                 polarity, args.binary_mode, args.crop_bottom, args.crop_top, args.track_half,
                 not args.no_z_invert)
+    logger.info('物理线宽过滤=%.0f~%.0fmm 二值宽度修正=%.2fx',
+                REAL_LINE_WIDTH_MODEL['min_width_mm'],
+                REAL_LINE_WIDTH_MODEL['max_width_mm'],
+                REAL_LINE_WIDTH_MODEL['segmentation_scale'])
 
     restart_requested = False
     try:

@@ -43,7 +43,8 @@ class LineDetector:
                  crop_bottom_frac=0.25, crop_top_frac=0.60,
                  track_half=50.0, scan_start_ratio=0.25,
                  binary_mode='otsu', fixed_threshold=100,
-                 adaptive_block=31, adaptive_c=8.0):
+                 adaptive_block=31, adaptive_c=8.0,
+                 line_width_model=None):
         self.work_width = work_width
         self.roi_top_ratio = roi_top_ratio          # 垂直方向：只处理底部这段(车前方地面)
         self.n_scan_rows = n_scan_rows              # 扫描行数
@@ -58,6 +59,8 @@ class LineDetector:
         self.fixed_threshold = int(np.clip(fixed_threshold, 0, 255))
         self.adaptive_block = max(3, int(adaptive_block) | 1)
         self.adaptive_c = float(adaptive_c)
+        self.line_width_model = self._validate_line_width_model(
+            line_width_model)
 
         # 上一帧车头参考行处的线中心(工作图 x)，兼作本帧搜索窗中心
         self._prev_cx = None
@@ -66,6 +69,39 @@ class LineDetector:
         # A left/right road becomes forward-facing after the vehicle enters it.
         # Remember that capture so its per-frame label can hand off to straight.
         self._captured_turn = None
+
+    @staticmethod
+    def _validate_line_width_model(model):
+        if model is None:
+            return None
+        clean = {name: float(model[name]) for name in (
+            'horizontal_fov_deg', 'camera_height_m', 'pitch_down_deg',
+            'segmentation_scale', 'min_width_mm', 'max_width_mm')}
+        if not 1.0 < clean['horizontal_fov_deg'] < 179.0:
+            raise ValueError('horizontal_fov_deg must be between 1 and 179')
+        if clean['camera_height_m'] <= 0 or clean['segmentation_scale'] <= 0:
+            raise ValueError('camera height and segmentation scale must be positive')
+        if not 0 < clean['min_width_mm'] < clean['max_width_mm']:
+            raise ValueError('line width range must be positive and ordered')
+        return clean
+
+    def _physical_line_width_mm(self, pixel_width, pixel_y, image_height):
+        """Convert a horizontal binary run to calibrated ground width."""
+        model = self.line_width_model
+        if model is None:
+            return None
+        cx = (self.work_width - 1) / 2.0
+        cy = (float(image_height) - 1) / 2.0
+        focal = cx / math.tan(math.radians(
+            model['horizontal_fov_deg']) / 2.0)
+        down_ray = (float(pixel_y) - cy) / focal
+        pitch = math.radians(model['pitch_down_deg'])
+        ray_down = math.sin(pitch) + down_ray * math.cos(pitch)
+        if ray_down <= 1e-6:
+            return None
+        metres_per_pixel = model['camera_height_m'] / (ray_down * focal)
+        return (float(pixel_width) * metres_per_pixel * 1000.0 *
+                model['segmentation_scale'])
 
     # ------------------------------------------------------------------
     def process(self, frame):
@@ -251,10 +287,26 @@ class LineDetector:
         # may contain one or two wide rows while its incoming stem stays valid.
         near_widths = np.asarray([point[2] for point in near_points],
                                  dtype=np.float64)
-        near_width_limit = max(25.0, ww * 0.08)
-        if float(np.median(near_widths)) > near_width_limit:
-            self._prev_cx = None
-            return self._empty_result(binary=binary, roi_top=roi_top)
+        line_width_mm = None
+        if self.line_width_model is not None:
+            physical_widths = [
+                self._physical_line_width_mm(point[2], point[1], wh)
+                for point in near_points]
+            physical_widths = [width for width in physical_widths
+                               if width is not None and math.isfinite(width)]
+            if not physical_widths:
+                self._prev_cx = None
+                return self._empty_result(binary=binary, roi_top=roi_top)
+            line_width_mm = float(np.median(physical_widths))
+            if not (self.line_width_model['min_width_mm'] <= line_width_mm <=
+                    self.line_width_model['max_width_mm']):
+                self._prev_cx = None
+                return self._empty_result(binary=binary, roi_top=roi_top)
+        else:
+            near_width_limit = max(25.0, ww * 0.08)
+            if float(np.median(near_widths)) > near_width_limit:
+                self._prev_cx = None
+                return self._empty_result(binary=binary, roi_top=roi_top)
 
         split_candidates = self._detect_split_branches(
             branch_mask, roi_top, ww, fit_coeffs, points)
@@ -325,6 +377,7 @@ class LineDetector:
             'centroid': (cx_fit, float(ref_y)),
             'error_px': float(error_px),          # 线在右 → 正 → 右转
             'angle_deg': float(angle_deg),
+            'line_width_mm': line_width_mm,
             'fit_coeffs': (None if fit_coeffs is None else
                            tuple(float(value) for value in fit_coeffs)),
             **corner,
@@ -891,6 +944,7 @@ class LineDetector:
             'junction_normal_width': 0.0,
             'branch_candidates': [],
             'line_end_candidate': False,
+            'line_width_mm': None,
             'points': [],
             'binary': binary,
             'roi_top': roi_top,
@@ -936,7 +990,8 @@ class LineFollower:
                  binary_mode='otsu', fixed_threshold=100,
                  adaptive_block=31, adaptive_c=8.0,
                  z_invert=True,   # 转向方向取反（默认 True）
-                 target_fps=20, debug=False, web_debug=None):
+                 target_fps=20, debug=False, web_debug=None,
+                 line_width_model=None):
         self.camera = camera
         self.chassis = chassis
         self.base_speed = base_speed
@@ -964,7 +1019,8 @@ class LineFollower:
             crop_bottom_frac=crop_bottom_frac, crop_top_frac=crop_top_frac,
             track_half=track_half, polarity=polarity,
             binary_mode=binary_mode, fixed_threshold=fixed_threshold,
-            adaptive_block=adaptive_block, adaptive_c=adaptive_c)
+            adaptive_block=adaptive_block, adaptive_c=adaptive_c,
+            line_width_model=line_width_model)
         self.target_fps = target_fps
         self.frame_interval = 1.0 / max(1, target_fps)
         self.debug = debug
