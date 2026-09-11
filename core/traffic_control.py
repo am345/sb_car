@@ -40,10 +40,6 @@ class TrafficControlRunner:
         self.active = False
         self.fault = ''
         self.last_fault = ''
-        self.previous_error = None
-        self.filtered_error = 0.0
-        self.filtered_angle = 0.0
-        self.last_turn = 0.0
         self.control_queue = deque(maxlen=400)
         self.control_route = None
         self.control_target = None
@@ -53,6 +49,7 @@ class TrafficControlRunner:
         self.started = False
         self.last_loop_state = None
         self.last_command = (0, 0, 0)
+        LineFollower.reset_tracking_controller(self.f)
 
     def _new_policy(self):
         return TrafficBehavior(self.f.base_speed, self.advance_m, self.f.max_z,
@@ -141,10 +138,7 @@ class TrafficControlRunner:
         self.started = False
         self.start_count = 0
         self.lost_since = None
-        self.previous_error = None
-        self.filtered_error = 0.0
-        self.filtered_angle = 0.0
-        self.last_turn = 0.0
+        LineFollower.reset_tracking_controller(self.f)
         self._clear_control_queue()
         self.last_command = (0, 0, 0)
 
@@ -248,14 +242,15 @@ class TrafficControlRunner:
             # Straight cruise; no visual steering, including when no line exists.
             return (300, 0, 0)
         if not det.get('is_valid'):
-            self.previous_error = None
-            self.last_turn = 0
+            LineFollower.reset_tracking_controller(self.f)
             self._clear_control_queue()
             return (0, 0, 0)
         f = self.f
         target = {
             'error_px': float(det['error_px']),
             'angle_deg': float(det['angle_deg']),
+            'path_curvature': float(det.get('path_curvature', 0.0)),
+            'memory_active': bool(det.get('memory_active')),
             'selected_branch_direction': det.get('selected_branch_direction'),
         }
         memory_active = bool(det.get('memory_active'))
@@ -274,10 +269,7 @@ class TrafficControlRunner:
             if route != self.control_route or backwards:
                 self._clear_control_queue()
                 self.control_route = route
-                self.previous_error = None
-                self.filtered_error = 0.0
-                self.filtered_angle = 0.0
-                self.last_turn = 0.0
+                LineFollower.reset_tracking_controller(self.f)
             self.control_last_distance = distance
             sample = dict(target, distance=distance, route=route)
             self.control_queue.append(sample)
@@ -290,36 +282,24 @@ class TrafficControlRunner:
                 self.control_target = matured
             target = (self.control_target or {
                 'error_px': 0.0, 'angle_deg': 0.0,
+                'path_curvature': 0.0, 'memory_active': False,
                 'selected_branch_direction': None})
-        err, angle = target['error_px'], target['angle_deg']
-        if self.previous_error is None:
-            self.filtered_error, self.filtered_angle = err, angle
-            self.previous_error = err
-        self.filtered_error = f.err_alpha*err+(1-f.err_alpha)*self.filtered_error
-        self.filtered_angle = f.err_alpha*angle+(1-f.err_alpha)*self.filtered_angle
-        derivative = (self.filtered_error-self.previous_error)/max(dt, 0.001)
-        self.previous_error = self.filtered_error
-        raw = f.kp*self.filtered_error + f.kd*derivative + f.ka*self.filtered_angle
+        effective_det = dict(det)
+        effective_det.update(target)
         limit = abs(f.max_z)
-        raw = max(-limit, min(limit, raw))
         rate_limit = f.z_rate_limit
         if (self.policy.task in ('left', 'right') and
                 target.get('selected_branch_direction') == self.policy.task):
             rate_limit = limit
-        raw = max(self.last_turn-rate_limit,
-                  min(self.last_turn+rate_limit, raw))
-        self.last_turn = raw
-        z = -raw if f.z_invert else raw
-        curve = max(0.3, 1-0.7*min(1, abs(z)/max(1, limit)))
+        steering = LineFollower.compute_tracking_steering(
+            f, effective_det, dt, rate_limit=rate_limit)
+        z = steering['turn']
         base = min(self.policy.cruise, self.policy.ceiling)
         if self.policy.state == 'branch-follow':
             return (round(base), 0, round(z))
-        speed = base*curve
-        if memory_active:
-            speed *= LineFollower.trajectory_speed_scale(angle)
-        if abs(err) > 40:
-            speed = min(speed, base*0.3)
-        return (round(speed), 0, round(z))
+        speed = LineFollower.compute_tracking_speed(
+            f, effective_det, z, base_speed=base, ramp=1.0)
+        return (speed, 0, round(z))
 
     def run(self, max_frames=None, stop_event=None):
         f = self.f
@@ -401,8 +381,7 @@ class TrafficControlRunner:
                 else:
                     state = self.fault or (self.policy.state if self.started else waiting)
                 if state != last_state:
-                    self.previous_error = None
-                    self.last_turn = 0
+                    LineFollower.reset_tracking_controller(f)
                     logger.info('交通状态=%s task=%s exit=%s', state, self.policy.task, self.policy.exits)
                     last_state = state
                 web_det = dict(det, work_width=f.detector.work_width,

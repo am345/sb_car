@@ -1264,6 +1264,78 @@ class LineFollower:
         return max(0.0, math.cos(math.radians(
             abs(float(heading_error_deg)))))
 
+    def reset_tracking_controller(self):
+        """Reset the shared visual tracking controller state."""
+        self._prev_err = 0.0
+        self._filtered_err = 0.0
+        self._filtered_angle = 0.0
+        self._has_prev = False
+        self._last_z = 0.0
+
+    def compute_tracking_steering(self, detection, dt, rate_limit=None):
+        """Compute steering for both the plain and traffic-control loops."""
+        err = float(detection['error_px'])
+        angle = float(detection['angle_deg'])
+        if not self._has_prev:
+            self._filtered_err = err
+            self._filtered_angle = angle
+            self._prev_err = err
+            self._has_prev = True
+
+        self._filtered_err = (self.err_alpha * err +
+                              (1-self.err_alpha) * self._filtered_err)
+        self._filtered_angle = (self.err_alpha * angle +
+                                (1-self.err_alpha) * self._filtered_angle)
+        err = self._filtered_err
+        angle = self._filtered_angle
+        derr = (err-self._prev_err) / max(float(dt), 0.001)
+        p_term = self.kp * err
+        d_term = self.kd * derr
+        angle_term = self.ka * angle
+        curvature_term = 18000.0 * float(
+            detection.get('path_curvature', 0.0))
+        raw = p_term+d_term+angle_term+curvature_term
+        raw = float(np.clip(raw, -abs(self.max_z), abs(self.max_z)))
+        step = self.z_rate_limit if rate_limit is None else float(rate_limit)
+        raw = float(np.clip(raw, self._last_z-step, self._last_z+step))
+        self._last_z = raw
+        self._prev_err = err
+        turn = -raw if self.z_invert else raw
+        if self.base_speed <= 0:
+            turn = 0.0
+        return {
+            'error_px': err,
+            'angle_deg': angle,
+            'turn': turn,
+            'p_term': p_term,
+            'd_term': d_term,
+            'angle_term': angle_term,
+            'curvature_term': curvature_term,
+        }
+
+    def compute_tracking_speed(self, detection, turn, base_speed=None,
+                               ramp=1.0):
+        """Compute translation speed for both real and simulated tracking."""
+        base = self.base_speed if base_speed is None else float(base_speed)
+        max_turn = max(1.0, abs(float(self.max_z)))
+        turn_ratio = min(1.0, abs(float(turn))/max_turn)
+        curve_scale = max(0.3, 1.0-0.7*turn_ratio)
+        preview_curvature = abs(float(
+            detection.get('path_curvature', 0.0)))
+        if preview_curvature > 1e-6:
+            radius_px = 1.0/preview_curvature
+            curve_scale = min(curve_scale, float(np.clip(
+                radius_px/110.0, 0.22, 1.0)))
+        if detection.get('memory_active'):
+            curve_scale = min(curve_scale,
+                              LineFollower.trajectory_speed_scale(
+                                  detection.get('angle_deg', 0.0)))
+        speed = int(round(base*float(ramp)*curve_scale))
+        if abs(float(getattr(
+                self, '_filtered_err', detection.get('error_px', 0.0)))) > 40:
+            speed = min(speed, int(round(base*0.3)))
+        return speed
+
     def _manual_control_step(self):
         pose = self.odometry.snapshot()
         now = time.monotonic()
@@ -1463,48 +1535,14 @@ class LineFollower:
                     self._lost_count = 0
                     self._last_sign = 1 if err >= 0 else -1
 
-                    if not self._has_prev:
-                        # 首帧：用真实误差初始化滤波器，避免 derr 尖峰把转向打满
-                        self._filtered_err = err
-                        self._filtered_angle = angle
-                        self._prev_err = err
-                        self._has_prev = True
-
-                    # 低通滤波（对误差与角度统一滤波）
-                    self._filtered_err = (self.err_alpha * err +
-                                          (1 - self.err_alpha) * self._filtered_err)
-                    self._filtered_angle = (self.err_alpha * angle +
-                                            (1 - self.err_alpha) * self._filtered_angle)
-                    err = self._filtered_err
-                    angle = self._filtered_angle
-
-                    # TODO-B5【PD + 方向角前馈】
-                    # 先计算误差变化率 derr，再分别计算 P、D、方向角前馈三项；
-                    # 相加得到 z_raw，并把结果限制到 [-max_z, max_z]。
-                    # 注意 dt 已做下限保护；首个有效帧在上方已初始化，避免微分冲击。
-                    # 验收：线向右移时原始 z 符号应指向右转；阶跃误差下输出不应失控。
-                    derr = (err - self._prev_err) / dt
-                    p_term = self.kp * err
-                    d_term = self.kd * derr
-                    angle_term = self.ka * angle
-                    # Pure-pursuit curvature is a preview feed-forward term:
-                    # it starts the turn before lateral error has accumulated.
-                    curvature_term = (18000.0 *
-                                      float(det.get('path_curvature', 0.0)))
-                    z_raw = p_term + d_term + angle_term + curvature_term
-                    z = float(np.clip(
-                        z_raw, -abs(self.max_z), abs(self.max_z)))
-
-                    # 转向速率限制：单帧最多变化 z_rate_limit mrad/s，防车身猛甩
-                    dz = z - self._last_z
-                    if abs(dz) > self.z_rate_limit:
-                        z = self._last_z + self.z_rate_limit * (1 if dz > 0 else -1)
-                    self._last_z = z
-
-                    if self.z_invert:          # 转向方向取反（z>0 左转 / z<0 右转）
-                        z = -z
-                    if self.base_speed <= 0:
-                        z = 0                  # speed=0 是真正的静止调试模式
+                    steering = self.compute_tracking_steering(det, dt)
+                    err = steering['error_px']
+                    angle = steering['angle_deg']
+                    z = steering['turn']
+                    p_term = steering['p_term']
+                    d_term = steering['d_term']
+                    angle_term = steering['angle_term']
+                    curvature_term = steering['curvature_term']
 
                     # TODO-B7a【起步确认】
                     # 只有连续 startup_frames 帧检测有效，才允许 self._started=True；
@@ -1525,7 +1563,6 @@ class LineFollower:
                                 send_fail = 0
                             else:
                                 send_fail += 1
-                            self._prev_err = err
 
                     # TODO-B6【起步斜坡 + 弯道降速】
                     # ramp 应在 ramp_frames 内从接近0逐步增至1；再根据 abs(z)/max_z
@@ -1538,32 +1575,12 @@ class LineFollower:
                             ramp = 1.0
                         else:
                             ramp = min(1.0, self._run_frames / self.ramp_frames)
-                        max_turn = max(1.0, abs(float(self.max_z)))
-                        turn_ratio = min(1.0, abs(z) / max_turn)
-                        curve_scale = max(0.3, 1.0 - 0.7 * turn_ratio)
-                        preview_curvature = abs(
-                            float(det.get('path_curvature', 0.0)))
-                        if preview_curvature > 1e-6:
-                            # Regulated Pure Pursuit principle: use the radius
-                            # of the visible path to slow before the steering
-                            # command saturates.  Pixel units are stable here
-                            # because detection always runs at work_width=320.
-                            radius_px = 1.0 / preview_curvature
-                            curvature_scale = float(np.clip(
-                                radius_px / 110.0, 0.22, 1.0))
-                            curve_scale = min(curve_scale, curvature_scale)
-                        if memory_cue is not None:
-                            heading_scale = self.trajectory_speed_scale(
-                                memory_cue['heading_error_deg'])
-                            curve_scale = min(curve_scale, heading_scale)
-                        speed = int(round(self.base_speed * ramp * curve_scale))
-                        if abs(err) > 40:
-                            speed = min(speed, int(round(self.base_speed * 0.3)))
+                        speed = self.compute_tracking_speed(
+                            det, z, ramp=ramp)
                         if self.chassis.send_speed(speed, 0, int(z)):
                             send_fail = 0
                         else:
                             send_fail += 1
-                        self._prev_err = err
                 else:
                     self._has_prev = False
                     self._filtered_err = 0.0

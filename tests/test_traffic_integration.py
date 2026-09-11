@@ -318,6 +318,27 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(command[0], 0)
         self.assertNotEqual(command[2], 0)
 
+    def test_traffic_mode_uses_the_same_tracking_math_as_plain_mode(self):
+        def controller():
+            return SimpleNamespace(
+                base_speed=300, max_z=800, kp=12.0, kd=1.2, ka=3.5,
+                err_alpha=.6, z_rate_limit=120, z_invert=True)
+
+        det = {'is_valid': True, 'error_px': 18, 'angle_deg': 12,
+               'path_curvature': .018,
+               'selected_branch_direction': None}
+        plain = controller()
+        LineFollower.reset_tracking_controller(plain)
+        steering = LineFollower.compute_tracking_steering(plain, det, .05)
+        expected = (
+            LineFollower.compute_tracking_speed(
+                plain, det, steering['turn'], base_speed=300, ramp=1.0),
+            0, round(steering['turn']))
+
+        runner = TrafficControlRunner(controller(), control_delay_m=0)
+
+        self.assertEqual(runner._tracking(det, .05), expected)
+
     def test_route_change_discards_queued_straight_targets(self):
         follower = SimpleNamespace(
             base_speed=300, max_z=800, kp=12.0, kd=0.0, ka=0.0,
