@@ -244,6 +244,18 @@ class LineDetector:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
+        # A drivable line must enter the near field as a narrow ribbon.  Floor
+        # shadows can survive Otsu and connected-component filtering as a
+        # tall, porous shape; their scan-line widths remain far larger than a
+        # perspective-expanded tape line.  Use the median so a real junction
+        # may contain one or two wide rows while its incoming stem stays valid.
+        near_widths = np.asarray([point[2] for point in near_points],
+                                 dtype=np.float64)
+        near_width_limit = max(25.0, ww * 0.08)
+        if float(np.median(near_widths)) > near_width_limit:
+            self._prev_cx = None
+            return self._empty_result(binary=binary, roi_top=roi_top)
+
         split_candidates = self._detect_split_branches(
             branch_mask, roi_top, ww, fit_coeffs, points)
         branch_candidates = (split_candidates or

@@ -143,6 +143,24 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(result['junction_right'], right)
             self.assertEqual(result['corner_dir'], 0)
 
+    def test_broad_porous_floor_shadow_is_not_a_track_or_l_turn(self):
+        frame = np.full((480, 640, 3), 220, np.uint8)
+        roi_top = 288
+        cv2.rectangle(frame, (270, 410), (370, 479), (30, 30, 30), -1)
+        cv2.line(frame, (320, 420), (240, 330), (30, 30, 30), 24)
+        cv2.rectangle(frame, (160, roi_top), (500, 330), (30, 30, 30), -1)
+        for x in range(220, 480, 45):
+            cv2.rectangle(frame, (x, 302), (x+25, 330),
+                          (220, 220, 220), -1)
+        detector = LineDetector(
+            roi_top_ratio=.6, crop_bottom_frac=.4,
+            crop_top_frac=.6, track_half=60, binary_mode='otsu')
+
+        result = detector.process(frame)
+
+        self.assertFalse(result['is_valid'])
+        self.assertEqual(result['corner_dir'], 0)
+
     def test_branch_candidates_keep_relative_direction_ids(self):
         corner = {'corner_point': (160, 150), 'corner_span': 180,
                   'junction_left': True, 'junction_straight': True,
