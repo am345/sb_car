@@ -22,14 +22,14 @@ CAMERA_PERIOD = 30
 WHEEL_RADIUS = 0.04
 HALF_WHEELBASE = 0.10
 HALF_TRACK = 0.13
-START_TRANSLATION = [-2.175, 0.0, 0.04]
 
 CONTROLLER_DIR = Path(__file__).resolve().parent
 PROTOTYPE_ROOT = CONTROLLER_DIR.parents[1]
 WORKSPACE_ROOT = PROTOTYPE_ROOT.parent
-PRODUCTION_ROOT = WORKSPACE_ROOT / "work" / "ipc_webui_patch"
+PRODUCTION_ROOT = WORKSPACE_ROOT
 VISION_DEPS = WORKSPACE_ROOT / "work" / "video_analysis_deps"
-sys.path.insert(0, str(VISION_DEPS))
+if VISION_DEPS.is_dir():
+    sys.path.insert(0, str(VISION_DEPS))
 sys.path.insert(0, str(PRODUCTION_ROOT))
 
 import cv2  # noqa: E402
@@ -43,23 +43,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s %(name)s] %(message)s",
 )
 
-EXPECTED_CORE_HASHES = {
-    "core/line_follower.py": "cf44916e114819664e2d1f82cdce002eb6b41f2c7a4b53fb0b70f879651a5916",
-    "core/odometry.py": "69b5645836cedfe7684597742ba2fc4cee84fc11c3553e861bb8135e46aa186b",
-}
-
-
 def verify_production_source():
+    """Record the repository sources used by this simulation run."""
     actual = {}
-    for relative_path, expected in EXPECTED_CORE_HASHES.items():
+    for relative_path in ("core/line_follower.py", "core/odometry.py"):
         path = PRODUCTION_ROOT / relative_path
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         actual[relative_path] = digest
-        if digest != expected:
-            raise RuntimeError(
-                f"Production source mismatch: {relative_path} is {digest}, expected {expected}"
-            )
-    logging.getLogger(__name__).info("实机/仿真核心源码哈希一致: %s", actual)
+    logging.getLogger(__name__).info("仿真使用仓库核心源码: %s", actual)
     return actual
 
 
@@ -319,10 +310,6 @@ web_config = {
     "track_half": 60.0,
     "startup_frames": 5,
     "ramp_frames": 20,
-    "corner_delay_frames": 10,
-    "corner_delay_speed": 40,
-    "corner_turn_degrees": 78.0,
-    "corner_turn_speed": 300,
     "lost_hold": 10,
     "search_frames": 15,
     "threshold": 100,

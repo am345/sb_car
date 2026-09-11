@@ -1,16 +1,11 @@
 {
-  "verified_at": "2026-09-10",
+  "verified_at": "2026-09-11",
   "remote_host": "bkrc3588s",
   "remote_root": "/home/bkrc/traffic_sign_control",
-  "simulation_root": "../work/ipc_webui_patch",
-  "identical_core_files": {
-    "core/line_follower.py": "cf44916e114819664e2d1f82cdce002eb6b41f2c7a4b53fb0b70f879651a5916",
+  "simulation_root": "..",
+  "repository_core_files": {
+    "core/line_follower.py": "cc8eecd0c176e5b9360905028dfdc2161507119af864cf1e0924e7cf430b0e08",
     "core/odometry.py": "69b5645836cedfe7684597742ba2fc4cee84fc11c3553e861bb8135e46aa186b",
-    "run.py": "eaeaf899e480468b539af1e2ae260ae8e1c6995400a66feebbbbe881c8623d3b"
-  },
-  "simulation_specific_file": {
-    "path": "debug_web.py",
-    "remote_sha256": "bac6c0f599779b508b178f62ca95c513657211b3af0d680c7972e1554c26b404",
-    "reason": "The local copy adds Webots-only labels and disables physical-device controls in simulation mode."
+    "run.py": "3b659ecc43eaceb2fa982423d41e7d82f478f71865366bfde889db190a1d5d51"
   }
 }

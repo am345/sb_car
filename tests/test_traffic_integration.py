@@ -7,7 +7,7 @@ import unittest
 import urllib.error
 import urllib.request
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -130,6 +130,82 @@ class IntegrationTests(unittest.TestCase):
         r.run(max_frames=3)
         self.assertIn('相机', r.fault)
         self.assertTrue(all(call.args==(0,0,0) for call in chassis.send_speed.call_args_list[1:]))
+
+    def test_generic_tracker_does_not_replace_curve_with_corner_state(self):
+        camera, chassis = Mock(), Mock()
+        camera.read.return_value = np.zeros((480, 640, 3), np.uint8)
+        chassis.send_speed.return_value = True
+        chassis.read_status.return_value = {
+            'real_x': 0, 'real_y': 0, 'real_z': 0, 'ang_vel_z': 0}
+        follower = LineFollower(
+            camera, chassis, base_speed=300, startup_frames=1,
+            ramp_frames=0, err_alpha=1.0, z_rate_limit=800)
+        follower.frame_interval = 0
+        follower.detector = Mock(
+            work_width=320, crop_top_frac=.6, crop_bottom_frac=.5,
+            binary_mode='otsu')
+        follower.detector.process.return_value = {
+            'is_valid': True, 'error_px': 25, 'angle_deg': 20,
+            'line_type': 'black',
+            # A tight continuous curve can resemble a one-sided L in image
+            # space. Generic tracking must keep steering instead of entering
+            # the old advance-then-rotate terrain state machine.
+            'corner_dir': 1, 'corner_y_ratio': .7, 'corner_span': 100,
+        }
+
+        with patch('core.line_follower.cv2.destroyAllWindows'):
+            follower.run(max_frames=3)
+
+        moving = [call.args for call in chassis.send_speed.call_args_list
+                  if call.args[0] > 0]
+        self.assertTrue(moving)
+        self.assertTrue(any(abs(command[2]) > 0 for command in moving))
+
+    def test_generic_tracker_slows_for_preview_curvature(self):
+        camera, chassis = Mock(), Mock()
+        camera.read.return_value = np.zeros((480, 640, 3), np.uint8)
+        chassis.send_speed.return_value = True
+        chassis.read_status.return_value = {
+            'real_x': 0, 'real_y': 0, 'real_z': 0, 'ang_vel_z': 0}
+        follower = LineFollower(
+            camera, chassis, base_speed=300, startup_frames=1,
+            ramp_frames=0, err_alpha=1.0, z_rate_limit=800)
+        follower.frame_interval = 0
+        follower.detector = Mock(
+            work_width=320, crop_top_frac=.6, crop_bottom_frac=.5,
+            binary_mode='otsu')
+        follower.detector.process.return_value = {
+            'is_valid': True, 'error_px': 0, 'angle_deg': 0,
+            'path_curvature': .02, 'line_type': 'black',
+        }
+
+        with patch('core.line_follower.cv2.destroyAllWindows'):
+            follower.run(max_frames=3)
+
+        moving = [call.args for call in chassis.send_speed.call_args_list
+                  if call.args[0] > 0]
+        self.assertTrue(moving)
+        self.assertLess(max(command[0] for command in moving), 200)
+        self.assertTrue(any(abs(command[2]) > 0 for command in moving))
+
+    def test_centerline_trace_preserves_a_sharp_bend_as_one_path(self):
+        binary = np.zeros((132, 320), np.uint8)
+        cv2.line(binary, (160, 131), (160, 65), 255, 12)
+        cv2.line(binary, (160, 65), (260, 65), 255, 12)
+
+        path = LineDetector._trace_centerline(binary)
+
+        self.assertGreater(len(path), 20)
+        self.assertGreater(path[-1][0], 240)
+        self.assertAlmostEqual(path[-1][1], 65, delta=5)
+        self.assertGreater(
+            LineDetector._lookahead_index(path, 100),
+            LineDetector._lookahead_index(path, 40))
+
+    def test_centerline_trace_rejects_line_disconnected_from_vehicle(self):
+        binary = np.zeros((132, 320), np.uint8)
+        cv2.line(binary, (30, 25), (290, 25), 255, 12)
+        self.assertEqual(LineDetector._trace_centerline(binary), [])
 
     def test_crossing_arms_and_near_geometry(self):
         d = LineDetector()

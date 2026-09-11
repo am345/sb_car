@@ -34,10 +34,6 @@ CONFIG_SCHEMA = {
     'track_half': (float, 5.0, 160.0),
     'startup_frames': (int, 1, 100),
     'ramp_frames': (int, 0, 200),
-    'corner_delay_frames': (int, 0, 200),
-    'corner_delay_speed': (int, 0, 300),
-    'corner_turn_degrees': (float, 10.0, 180.0),
-    'corner_turn_speed': (int, 50, 1000),
     'lost_hold': (int, 0, 100),
     'search_frames': (int, 0, 200),
     'threshold': (int, 0, 255),
@@ -204,10 +200,7 @@ const fields=[
  ['roi_top','ROI 起点','number','0.05'],['scan_start','扫描起点','number','0.05'],
  ['crop_bottom','近处宽度比','number','0.05'],['crop_top','远处宽度比','number','0.05'],
  ['track_half','搜索窗半宽 px','number','1'],['startup_frames','起步确认帧','number','1'],
- ['ramp_frames','加速斜坡帧','number','1'],['corner_delay_frames','L弯转向延迟帧','number','1'],
- ['corner_delay_speed','L弯延迟速度 mm/s','number','1'],
- ['corner_turn_degrees','L弯旋转角度 °','number','1'],
- ['corner_turn_speed','L弯旋转速度 mrad/s','number','1'],
+ ['ramp_frames','加速斜坡帧','number','1'],
  ['lost_hold','失线保持帧','number','1'],
  ['search_frames','失线搜索帧','number','1'],['threshold','固定阈值','number','1'],
  ['adaptive_block','自适应邻域','number','2'],['adaptive_c','自适应 C','number','0.5'],
@@ -779,10 +772,20 @@ class DebugWebServer:
         for x, y, width in det.get('points') or []:
             cv2.circle(raw, (int(x * scale), int(y * scale)), 4, (40, 240, 90), -1)
         if det.get('is_valid') and det.get('points'):
-            y0 = min(p[1] for p in det['points'])
-            y1 = max(p[1] for p in det['points'])
-            coeffs = det.get('fit_coeffs')
-            if coeffs is not None and len(coeffs) == 3:
+            path_points = det.get('path_points') or []
+            if len(path_points) >= 2:
+                curve = np.asarray(
+                    [[point[0] * scale, point[1] * scale]
+                     for point in path_points], dtype=np.float64)
+                cv2.polylines(raw, [np.rint(curve).astype(np.int32)], False,
+                              (0, 255, 255), 3, lineType=cv2.LINE_AA)
+            else:
+                y0 = min(p[1] for p in det['points'])
+                y1 = max(p[1] for p in det['points'])
+                coeffs = det.get('fit_coeffs')
+                if coeffs is None or len(coeffs) != 3:
+                    coeffs = None
+            if not path_points and coeffs is not None:
                 fit_ys = np.linspace(y0, y1, 40)
                 fit_xs = np.polyval(coeffs, fit_ys)
                 curve = np.column_stack((fit_xs * scale, fit_ys * scale))
@@ -790,6 +793,12 @@ class DebugWebServer:
                 curve[:, 1] = np.clip(curve[:, 1], 0, work_height - 1)
                 cv2.polylines(raw, [np.rint(curve).astype(np.int32)], False,
                               (0, 255, 255), 3, lineType=cv2.LINE_AA)
+        lookahead = det.get('lookahead_point')
+        if lookahead is not None:
+            point = (int(round(lookahead[0] * scale)),
+                     int(round(lookahead[1] * scale)))
+            cv2.circle(raw, point, 9, (255, 0, 255), 3,
+                       lineType=cv2.LINE_AA)
         corner = det.get('corner_point')
         corner_dir = int(det.get('corner_dir', 0))
         detailed_branches = any(candidate.get('points')
@@ -804,7 +813,7 @@ class DebugWebServer:
             cv2.putText(raw, 'CROSS-STRAIGHT',
                         (max(5, junction_px[0] - 75), max(24, junction_px[1] - 14)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-        if corner is not None and corner_dir:
+        if corner is not None and corner_dir and not det.get('path_points'):
             corner_px = (int(round(corner[0] * scale)),
                          int(round(corner[1] * scale)))
             arrow_px = (corner_px[0] + corner_dir * 70, corner_px[1])
@@ -815,7 +824,7 @@ class DebugWebServer:
             cv2.putText(raw, 'L-RIGHT' if corner_dir > 0 else 'L-LEFT',
                         (max(5, corner_px[0] - 45), max(24, corner_px[1] - 14)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 80, 255), 2)
-        cv2.putText(raw, 'RAW + FIT', (12, 26), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(raw, 'RAW + PATH', (12, 26), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (0, 255, 255), 2)
 
         binary_panel = np.full((work_height, work_width, 3), 255, np.uint8)

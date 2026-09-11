@@ -197,6 +197,61 @@ class LineDetector:
         # 寻找“纵向主干 + 单侧长横臂”，把方向和拐点位置交给控制状态机。
         corner = self._detect_l_corner(binary, roi_top)
 
+        # Normal driving uses one geometry-agnostic path representation.  A
+        # thinned connected component is traced from the vehicle toward the
+        # farthest visible point, so a sharp bend or roundabout does not need
+        # to be expressible as the single-valued image function x=f(y).
+        if self.path_preference is None:
+            path = self._trace_centerline(binary, self._prev_cx)
+            if len(path) >= 4:
+                target_index = self._lookahead_index(path, roi_h * 0.36)
+                near_x, near_y = path[0]
+                target_x, target_y = path[target_index]
+                near_error = near_x - center
+                target_error = target_x - center
+                error_px = 0.35 * near_error + 0.65 * target_error
+                forward_px = max(1.0, near_y - target_y)
+                angle_deg = math.degrees(math.atan2(
+                    target_x - near_x, forward_px))
+                chord_sq = ((target_x - near_x) ** 2 +
+                            (target_y - near_y) ** 2)
+                path_curvature = (2.0 * (target_x - near_x) /
+                                  max(1.0, chord_sq))
+                self._prev_cx = (float(near_x) if self._prev_cx is None else
+                                 0.6 * float(near_x) + 0.4 * self._prev_cx)
+                points = [(float(x), float(y + roi_top), 1)
+                          for x, y in path]
+                fit_coeffs = None
+                if len({int(round(y)) for _, y in path}) >= 3:
+                    try:
+                        ys = np.asarray([y + roi_top for _, y in path],
+                                        dtype=np.float64)
+                        xs = np.asarray([x for x, _ in path], dtype=np.float64)
+                        fit_coeffs = tuple(float(value) for value in
+                                           np.polyfit(ys, xs, 2))
+                    except (ValueError, np.linalg.LinAlgError):
+                        fit_coeffs = None
+                return {
+                    'is_valid': True,
+                    'centroid': (float(target_x),
+                                 float(target_y + roi_top)),
+                    'error_px': float(error_px),
+                    'angle_deg': float(angle_deg),
+                    'path_curvature': float(path_curvature),
+                    'fit_coeffs': fit_coeffs,
+                    **corner,
+                    'branch_candidates': [],
+                    'selected_branch_direction': None,
+                    'line_end_candidate': False,
+                    'points': points,
+                    'path_points': points,
+                    'lookahead_point': (float(target_x),
+                                        float(target_y + roi_top)),
+                    'binary': binary,
+                    'roi_top': roi_top,
+                    'line_type': self.polarity,
+                }
+
         # --- 4. 扫描线 + 滑动搜索窗 ---
         # 预测位置作为搜索窗中心；丢线后重捕获时清空预测窗
         pred = self._prev_cx if self._prev_cx is not None else center
@@ -325,6 +380,93 @@ class LineDetector:
             'roi_top': roi_top,
             'line_type': self.polarity,
         }
+
+    @staticmethod
+    def _lookahead_index(path, distance):
+        """Return the first path index at least ``distance`` pixels ahead."""
+        travelled = 0.0
+        for index in range(1, len(path)):
+            x0, y0 = path[index - 1]
+            x1, y1 = path[index]
+            travelled += math.hypot(x1 - x0, y1 - y0)
+            if travelled >= distance:
+                return index
+        return len(path) - 1
+
+    @staticmethod
+    def _trace_centerline(binary, predicted_x=None):
+        """Trace a connected tape centreline from near vehicle to far view.
+
+        Morphological skeletonisation preserves topology for straight lines,
+        smooth curves, roundabouts and sharp bends.  Breadth-first traversal
+        then orders the skeleton without assuming one x value per image row.
+        """
+        work = (binary > 0).astype(np.uint8) * 255
+        skeleton = np.zeros_like(work)
+        element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        for _ in range(64):
+            if not np.any(work):
+                break
+            opened = cv2.morphologyEx(work, cv2.MORPH_OPEN, element)
+            skeleton = cv2.bitwise_or(
+                skeleton, cv2.subtract(work, opened))
+            work = cv2.erode(work, element)
+
+        ys, xs = np.nonzero(skeleton)
+        if len(xs) < 4:
+            return []
+        height, width = binary.shape[:2]
+        near = [(int(x), int(y)) for x, y in zip(xs, ys)
+                if y >= int(height * 0.72)]
+        if not near:
+            return []
+        anchor_x = width / 2.0 if predicted_x is None else float(predicted_x)
+        seed = max(near, key=lambda point: (
+            point[1], -abs(point[0] - anchor_x)))
+        pixels = {(int(x), int(y)) for x, y in zip(xs, ys)}
+        queue = [seed]
+        parent = {seed: None}
+        distance = {seed: 0.0}
+        for current in queue:
+            cx, cy = current
+            for dx, dy in ((-1, -1), (0, -1), (1, -1),
+                           (-1, 0),           (1, 0),
+                           (-1, 1),  (0, 1),  (1, 1)):
+                nxt = (cx + dx, cy + dy)
+                if nxt not in pixels or nxt in parent:
+                    continue
+                parent[nxt] = current
+                distance[nxt] = distance[current] + math.hypot(dx, dy)
+                queue.append(nxt)
+        if len(parent) < 4:
+            return []
+
+        # Geodesic distance follows bends and loops.  A small upward-progress
+        # bonus rejects short skeleton spurs near the vehicle.
+        target = max(parent, key=lambda point: (
+            distance[point] + 0.25 * max(0, seed[1] - point[1])))
+        ordered = []
+        current = target
+        while current is not None:
+            ordered.append((float(current[0]), float(current[1])))
+            current = parent[current]
+        ordered.reverse()
+
+        # Downsample by arc length; this reduces pixel stair-steps without
+        # destroying sharp corners or assuming any particular track shape.
+        sampled = [ordered[0]]
+        accumulated = 0.0
+        previous = ordered[0]
+        for point in ordered[1:]:
+            accumulated += math.hypot(
+                point[0] - previous[0], point[1] - previous[1])
+            if accumulated >= 4.0:
+                sampled.append(point)
+                accumulated = 0.0
+            previous = point
+        if sampled[-1] != ordered[-1]:
+            sampled.append(ordered[-1])
+        return sampled
 
     def _select_continuous_path(self, points):
         """保留横向连续的最长扫描点链，剔除跳到地缝/反光边缘的点。"""
@@ -887,11 +1029,11 @@ class LineDetector:
 
 
 # =====================================================================
-# 2. 巡线主控制器（简化 PD + 角度前馈）
+# 2. 通用路径跟踪控制器（PD + 前视角/曲率前馈）
 # =====================================================================
 class LineFollower:
     """
-    巡线主控制器：相机取帧 → 检测 → PD 控制 → 串口底盘。
+    通用巡线控制器：相机取帧 → 有序中心线 → 连续控制 → 串口底盘。
 
     参数（均为底盘串口约定单位）：
       base_speed  直道巡航速度 mm/s
@@ -901,10 +1043,6 @@ class LineFollower:
       lost_hold   失线低速直行的帧数上限，超过则停车
       startup_frames 起步确认帧数：连续检测到线这么多帧后车辆才开始前进(默认5)
       ramp_frames    起步后速度从0平滑加速到目标的帧数(默认20，约1秒)
-      corner_delay_frames 确认L弯后低速直行多少帧再转向；越大转得越晚(默认10)
-      corner_delay_speed  L弯延迟直行阶段的速度 mm/s(默认40)
-      corner_turn_degrees L弯原地旋转的目标角度；越大转得越多(默认78度)
-      corner_turn_speed   L弯原地旋转的目标速度 mrad/s(默认300)
       start_rotate   起步确认期间是否原地转向对准线(默认False:静止确认后边前进边修正)
     """
 
@@ -914,8 +1052,6 @@ class LineFollower:
                  err_alpha=0.6, z_rate_limit=120.0,
                  lost_hold=10, search_frames=15,
                  startup_frames=5, ramp_frames=20,
-                 corner_delay_frames=10, corner_delay_speed=40,
-                 corner_turn_degrees=78.0, corner_turn_speed=300,
                  start_rotate=False,
                  work_width=320, roi_top_ratio=0.45,
                  n_scan_rows=12, scan_start_ratio=0.25,
@@ -939,11 +1075,6 @@ class LineFollower:
         self.z_invert = z_invert            # 转向方向取反(硬件/装向与协议约定相反时使用)
         self.startup_frames = startup_frames  # 起步确认帧数：线连续稳定这么多帧后才前进
         self.ramp_frames = ramp_frames        # 起步后速度从0平滑加速到目标所用帧数
-        self.corner_delay_frames = max(0, int(corner_delay_frames))
-        self.corner_delay_speed = max(0, int(corner_delay_speed))
-        self.corner_turn_radians = math.radians(
-            float(np.clip(corner_turn_degrees, 10.0, 180.0)))
-        self.corner_turn_speed = int(np.clip(corner_turn_speed, 50, 1000))
         self.start_rotate = start_rotate      # 起步是否原地转向对准线(默认关，静止确认后前进)
 
         self.detector = LineDetector(
@@ -970,13 +1101,6 @@ class LineFollower:
         self._start_seen = 0      # 起步期连续有效帧计数
         self._started = False     # 起步确认是否完成(完成后才前进)
         self._run_frames = 0      # 起步后已运行帧数(速度斜坡用)
-        self._corner_dir = 0      # 正在执行的 L 弯方向：-1左，+1右
-        self._corner_frames = 0
-        self._corner_phase = ''   # advance: 越过拐点；turn: 原地转向
-        self._corner_turn_radians = 0.0
-        self._corner_confirm_dir = 0
-        self._corner_confirm_count = 0
-        self._corner_exit_frames = 0  # 完成一个 L 后短暂忽略旧拐角，允许连续 L
         self.fps = 0.0
         self._fps_n = 0
         self._fps_t = time.time()
@@ -1097,11 +1221,6 @@ class LineFollower:
         self._start_seen = 0
         self._started = False
         self._run_frames = 0
-        self._corner_dir = 0
-        self._corner_frames = 0
-        self._corner_phase = ''
-        self._corner_turn_radians = 0.0
-        self._corner_exit_frames = 0
 
     def _manual_control_step(self):
         pose = self.odometry.snapshot()
@@ -1229,7 +1348,7 @@ class LineFollower:
                 det = self.detector.process(frame)
                 err = det['error_px']
                 angle = det['angle_deg']
-                p_term = d_term = angle_term = 0.0
+                p_term = d_term = angle_term = curvature_term = 0.0
 
                 if self._manual_mode.is_set():
                     chassis_status = self.chassis.read_status()
@@ -1286,122 +1405,12 @@ class LineFollower:
                     self._reset_tracking_state()
                     self._resume_tracking.clear()
 
-                detected_corner = int(det.get('corner_dir', 0))
-                if self._corner_exit_frames > 0:
-                    self._corner_exit_frames -= 1
-                    observed_corner = 0
-                else:
-                    observed_corner = detected_corner
-                corner_near = float(det.get('corner_y_ratio', 0.0)) >= 0.52
-                if (self._corner_dir == 0 and self._started and
-                        det['is_valid'] and observed_corner and corner_near):
-                    self._corner_dir = observed_corner
-                    self._corner_frames = 0
-                    self._corner_phase = 'advance'
-                    self._corner_turn_radians = 0.0
-                    logger.info('识别到%s L 弯，跨度=%.0fpx，立即进入后续流程',
-                                '左' if observed_corner < 0 else '右',
-                                float(det.get('corner_span', 0.0)))
-                elif self._corner_dir == 0:
-                    self._corner_confirm_dir = 0
-                    self._corner_confirm_count = 0
-
-                corner_handled = False
-                if self._corner_dir:
-                    # 识别到 L 后不立刻转：按可调帧数低速直行，让车身中心
-                    # 到达拐点后再进入有界的原地转向。
-                    if self._corner_phase == 'advance':
-                        if self._corner_frames >= self.corner_delay_frames:
-                            self._corner_phase = 'turn'
-                            self._corner_frames = 0
-                            logger.info('%s L 弯已到近处，开始受限原地转向',
-                                        '左' if self._corner_dir < 0 else '右')
-                        else:
-                            self._corner_frames += 1
-                            z = 0
-                            speed = min(self.corner_delay_speed,
-                                        max(0, int(self.base_speed)))
-                            state = ('corner-delay-left' if self._corner_dir < 0
-                                     else 'corner-delay-right')
-                            if self.base_speed <= 0:
-                                speed = 0
-                            if self.chassis.send_speed(speed, 0, 0):
-                                send_fail = 0
-                            else:
-                                send_fail += 1
-                            corner_handled = True
-
-                    # 出口线转成近似纵向后即可结束，不再强制长时间旋转。
-                    reacquired = (self._corner_phase == 'turn' and
-                                  self._corner_turn_radians >= 0.75 and
-                                  det['is_valid'] and
-                                  observed_corner == 0 and abs(angle) < 35 and
-                                  abs(err) < 55)
-                    if not corner_handled and reacquired:
-                        logger.info('%s L 弯出口已重新捕获',
-                                    '左' if self._corner_dir < 0 else '右')
-                        self._corner_dir = 0
-                        self._corner_frames = 0
-                        self._corner_phase = ''
-                        self._corner_turn_radians = 0.0
-                        self._corner_confirm_dir = 0
-                        self._corner_confirm_count = 0
-                        self._corner_exit_frames = 15
-                        self._has_prev = False
-                        self._last_z = 0.0
-                    elif not corner_handled:
-                        self._corner_frames += 1
-                        self._lost_count = 0
-                        self._has_prev = False
-                        self._filtered_err = 0.0
-                        self._filtered_angle = 0.0
-                        turn_limit = min(abs(float(self.max_z)),
-                                         float(self.corner_turn_speed))
-                        turn_mag = min(turn_limit,
-                                       100.0 + self._corner_frames * 15.0)
-                        raw_z = self._corner_dir * turn_mag
-                        self._last_sign = self._corner_dir
-                        turn_complete = (self._corner_turn_radians >= self.corner_turn_radians or
-                                         self._corner_frames > 110)
-                        if turn_complete:
-                            logger.info('%s L 弯旋转完成 %.1f°，进入低速循迹退出阶段',
-                                        '左' if self._corner_dir < 0 else '右',
-                                        math.degrees(self._corner_turn_radians))
-                            self._corner_dir = 0
-                            self._corner_frames = 0
-                            self._corner_phase = ''
-                            self._corner_turn_radians = 0.0
-                            self._corner_confirm_dir = 0
-                            self._corner_confirm_count = 0
-                            self._corner_exit_frames = 15
-                            self._has_prev = False
-                            self._last_z = 0.0
-                            z = 0
-                            speed = 0
-                            state = 'corner-exit'
-                            if self.chassis.send_speed(0, 0, 0):
-                                send_fail = 0
-                            else:
-                                send_fail += 1
-                            corner_handled = True
-                        else:
-                            self._corner_turn_radians += abs(raw_z) * dt / 1000.0
-                            self._last_z = raw_z
-                            z = -raw_z if self.z_invert else raw_z
-                            if self.base_speed <= 0:
-                                z = 0
-                            speed = 0
-                            state = ('corner-left' if self._corner_dir < 0
-                                     else 'corner-right')
-                            if self.chassis.send_speed(0, 0, int(z)):
-                                send_fail = 0
-                            else:
-                                send_fail += 1
-                            corner_handled = True
-
-                if corner_handled:
-                    pass
-                elif det['is_valid']:
+                # Straight lines, smooth curves, roundabouts and sharp bends
+                # all use the same continuous path controller.  Corner
+                # metadata remains available to the opt-in traffic planner,
+                # but it must not replace steering with a terrain-specific
+                # advance-then-rotate state machine.
+                if det['is_valid']:
                     state = 'run'
                     self._lost_count = 0
                     self._last_sign = 1 if err >= 0 else -1
@@ -1430,7 +1439,11 @@ class LineFollower:
                     p_term = self.kp * err
                     d_term = self.kd * derr
                     angle_term = self.ka * angle
-                    z_raw = p_term + d_term + angle_term
+                    # Pure-pursuit curvature is a preview feed-forward term:
+                    # it starts the turn before lateral error has accumulated.
+                    curvature_term = (18000.0 *
+                                      float(det.get('path_curvature', 0.0)))
+                    z_raw = p_term + d_term + angle_term + curvature_term
                     z = float(np.clip(
                         z_raw, -abs(self.max_z), abs(self.max_z)))
 
@@ -1480,22 +1493,20 @@ class LineFollower:
                         max_turn = max(1.0, abs(float(self.max_z)))
                         turn_ratio = min(1.0, abs(z) / max_turn)
                         curve_scale = max(0.3, 1.0 - 0.7 * turn_ratio)
+                        preview_curvature = abs(
+                            float(det.get('path_curvature', 0.0)))
+                        if preview_curvature > 1e-6:
+                            # Regulated Pure Pursuit principle: use the radius
+                            # of the visible path to slow before the steering
+                            # command saturates.  Pixel units are stable here
+                            # because detection always runs at work_width=320.
+                            radius_px = 1.0 / preview_curvature
+                            curvature_scale = float(np.clip(
+                                radius_px / 110.0, 0.22, 1.0))
+                            curve_scale = min(curve_scale, curvature_scale)
                         speed = int(round(self.base_speed * ramp * curve_scale))
                         if abs(err) > 40:
                             speed = min(speed, int(round(self.base_speed * 0.3)))
-                        if self._corner_exit_frames > 0:
-                            # 已完成的旧拐角可能仍在高位摄像头视野内。退出阶段
-                            # 保留正常循迹转向，只限制前进速度，避免再次触发旧 L。
-                            speed = min(speed, int(round(self.base_speed * 0.35)))
-                            state = 'corner-exit'
-                        elif observed_corner:
-                            # 拐点尚远时继续沿主干靠近，但预先减速；达到触发线后
-                            # 上面的确认逻辑会切换为原地转向。
-                            speed = min(speed, int(round(self.base_speed * 0.35)))
-                            z = 0
-                            self._last_z = 0.0
-                            state = ('corner-approach-left' if observed_corner < 0
-                                     else 'corner-approach-right')
                         if self.chassis.send_speed(speed, 0, int(z)):
                             send_fail = 0
                         else:
@@ -1536,6 +1547,7 @@ class LineFollower:
                         'p_term': float(p_term),
                         'd_term': float(d_term),
                         'angle_term': float(angle_term),
+                        'curvature_term': float(curvature_term),
                         'fps': float(self.fps),
                         'max_z': abs(float(self.max_z)),
                         'lost_count': self._lost_count,
@@ -1544,13 +1556,6 @@ class LineFollower:
                         'startup_frames': self.startup_frames,
                         'started': self._started,
                         'binary_mode': self.detector.binary_mode,
-                        'corner_phase': self._corner_phase,
-                        'corner_exit_frames': self._corner_exit_frames,
-                        'corner_delay_frames': self.corner_delay_frames,
-                        'corner_delay_speed': self.corner_delay_speed,
-                        'corner_turn_target_deg': math.degrees(self.corner_turn_radians),
-                        'corner_turn_speed': self.corner_turn_speed,
-                        'corner_turn_deg': math.degrees(self._corner_turn_radians),
                         **odometry,
                         **self.manual_control_status(),
                     })
