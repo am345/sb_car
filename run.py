@@ -54,6 +54,7 @@ _WEB_CONFIG_PATH = os.path.join(_CASE_DIR, 'web_config.json')
 REAL_CAMERA_HFOV_DEG = 100.0
 REAL_CAMERA_HEIGHT_M = 0.23
 REAL_CAMERA_PITCH_DEG = 8.0
+REAL_CAMERA_FORWARD_M = 0.32
 
 
 def _load_web_config(logger):
@@ -137,8 +138,9 @@ def main():
     parser.add_argument('--camera-pitch-deg', type=float,
                         default=REAL_CAMERA_PITCH_DEG,
                         help='摄像头向下俯角，轨迹记忆使用（实机估计8°）')
-    parser.add_argument('--camera-forward-m', type=float, default=0.115,
-                        help='摄像头相对车体旋转中心向前距离（默认0.115m）')
+    parser.add_argument('--camera-forward-m', type=float,
+                        default=REAL_CAMERA_FORWARD_M,
+                        help='摄像头相对车体旋转中心向前距离（车头前伸0.17m，合计0.32m）')
     parser.add_argument('--speed', type=int, default=160,
                         help='直道巡航速度 mm/s（底盘限幅 ±300）')
     parser.add_argument('--max-z', type=int, default=800,
