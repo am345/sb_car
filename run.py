@@ -46,6 +46,15 @@ from debug_web import CONFIG_SCHEMA, DebugWebServer
 
 _WEB_CONFIG_PATH = os.path.join(_CASE_DIR, 'web_config.json')
 
+# Estimated from the mounted 640x480 camera view on 2026-09-11.  With a
+# roughly 30 mm track line, the observed bottom-of-frame width and horizon
+# agree with a 100 degree HFOV, 0.23 m optical-centre height and 8 degree
+# downward pitch.  These are real-camera adapter values, not controller
+# tuning; replace them after a measured camera calibration is available.
+REAL_CAMERA_HFOV_DEG = 100.0
+REAL_CAMERA_HEIGHT_M = 0.23
+REAL_CAMERA_PITCH_DEG = 8.0
+
 
 def _load_web_config(logger):
     try:
@@ -119,12 +128,15 @@ def main():
                         help='网页图像刷新率上限（默认8 FPS）')
     parser.add_argument('--exposure', type=int, default=150,
                         help='摄像头手动曝光值（默认150）')
-    parser.add_argument('--camera-hfov-deg', type=float, default=90.0,
-                        help='摄像头水平视场角，轨迹记忆地面投影使用（默认90°）')
-    parser.add_argument('--camera-height-m', type=float, default=0.14,
-                        help='摄像头离地高度，轨迹记忆使用（默认0.14m）')
-    parser.add_argument('--camera-pitch-deg', type=float, default=8.02,
-                        help='摄像头向下俯角，轨迹记忆使用（默认8.02°）')
+    parser.add_argument('--camera-hfov-deg', type=float,
+                        default=REAL_CAMERA_HFOV_DEG,
+                        help='摄像头水平视场角，轨迹记忆地面投影使用（实机估计100°）')
+    parser.add_argument('--camera-height-m', type=float,
+                        default=REAL_CAMERA_HEIGHT_M,
+                        help='摄像头光心离地高度，轨迹记忆使用（实机估计0.23m）')
+    parser.add_argument('--camera-pitch-deg', type=float,
+                        default=REAL_CAMERA_PITCH_DEG,
+                        help='摄像头向下俯角，轨迹记忆使用（实机估计8°）')
     parser.add_argument('--camera-forward-m', type=float, default=0.115,
                         help='摄像头相对车体旋转中心向前距离（默认0.115m）')
     parser.add_argument('--speed', type=int, default=160,
