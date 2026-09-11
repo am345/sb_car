@@ -224,6 +224,12 @@ class LineDetector:
             fill = area / float(bw_ * bh_)          # 0~1，实心色块接近1
             if bw_ > 8 and bh_ > 8 and fill > 0.85:
                 continue                            # 实心大色块→剔除(防假检)
+            # A side-attached, broad porous wedge is typically a floor shadow
+            # or furniture edge, not a tape ribbon. Keep central wide blobs so
+            # genuine intersections remain available to the branch detector.
+            side_attached = x_ <= ww * 0.12 or x_ + bw_ >= ww * 0.88
+            if side_attached and bw_ > ww * 0.30 and bh_ > roi_h * 0.60:
+                continue
             line_mask[labels == i] = 255
         binary = line_mask
         if int(binary.max()) == 0:
@@ -628,6 +634,12 @@ class LineDetector:
         preference = (self.path_preference if preference_override is None
                       else preference_override)
         guided = preference in ('left', 'right', 'continuation')
+        if not guided:
+            # Hybrid path selection: retain several row candidates and choose
+            # one globally smooth ribbon instead of taking the widest run per
+            # row. This rejects broad floor shadows that happen to be long.
+            return self._scan_shape_continuous_path(
+                binary, roi_top, ww, inside, pred)
         if guided:
             rows = rows[::-1]  # trace the connected approach from near to far
         anchor = ww/2 if pred is None else pred
@@ -703,6 +715,101 @@ class LineDetector:
                 anchor = pred = cx
             points.append((cx, rel_y + roi_top, bw))
         return sorted(points, key=lambda p: p[1]) if guided else points
+
+    def _scan_shape_continuous_path(self, binary, roi_top, ww, inside, pred):
+        """Select a globally smooth ribbon from multi-run scan candidates.
+
+        This is deliberately pixel-space only: no camera intrinsics or metric
+        width model is needed. A path is rewarded for smooth center movement
+        and stable run width, and penalized for broad/edge-touching blobs.
+        """
+        roi_h = binary.shape[0]
+        rows = np.linspace(int(roi_h * self.scan_start_ratio),
+                           roi_h - 1, self.n_scan_rows).astype(int)
+        row_candidates = []
+        for rel_y in rows:
+            allowed = np.flatnonzero(inside[rel_y])
+            if allowed.size == 0:
+                row_candidates.append([])
+                continue
+            l0, r0 = int(allowed[0]), int(allowed[-1]) + 1
+            seg = binary[rel_y, l0:r0]
+            fg = np.flatnonzero(seg)
+            candidates = []
+            if fg.size:
+                runs = np.split(fg, np.flatnonzero(np.diff(fg) > 1) + 1)
+                minimum = max(self.min_seg_width,
+                              round(3 + 5 * rel_y / max(1, roi_h - 1)))
+                usable_width = max(1, r0 - l0)
+                for run in runs:
+                    bw = int(run[-1] - run[0] + 1)
+                    if bw < minimum:
+                        continue
+                    cx = l0 + (float(run[0]) + float(run[-1])) / 2.0
+                    edge = min(cx - l0, r0 - 1 - cx)
+                    blob_penalty = max(0.0, bw / usable_width - 0.24) * 80.0
+                    edge_penalty = 8.0 if edge <= 1 else 0.0
+                    candidates.append({
+                        'cx': cx, 'bw': float(bw), 'y': rel_y + roi_top,
+                        'base': blob_penalty + edge_penalty,
+                    })
+            row_candidates.append(candidates)
+
+        states = []
+        for row_index, candidates in enumerate(row_candidates):
+            if not candidates:
+                states.append([])
+                continue
+            current = []
+            previous = states[-1] if states else []
+            for candidate in candidates:
+                if not previous:
+                    anchor_cost = (abs(candidate['cx'] - pred) * 0.35
+                                   if pred is not None else
+                                   abs(candidate['cx'] - ww / 2.0) * 0.08)
+                    current.append((candidate['base'] + anchor_cost, None,
+                                    candidate['cx'], candidate['bw']))
+                    continue
+                best = None
+                prev_candidates = row_candidates[row_index - 1]
+                for j, state in enumerate(previous):
+                    prev_cost, _, prev_cx, prev_bw = state
+                    previous_candidate = prev_candidates[j]
+                    dy = max(1.0, candidate['y'] - previous_candidate['y'])
+                    dx = candidate['cx'] - prev_cx
+                    slope_cost = min(80.0, abs(dx / dy) * 2.2)
+                    width_cost = min(60.0,
+                                     abs(np.log((candidate['bw'] + 1.0) /
+                                                (prev_bw + 1.0))) * 18.0)
+                    cost = prev_cost + candidate['base'] + slope_cost + width_cost
+                    if best is None or cost < best[0]:
+                        best = (cost, j, candidate['cx'], candidate['bw'])
+                current.append(best)
+            states.append(current)
+
+        nonempty = [(i, state) for i, state in enumerate(states) if state]
+        if not nonempty:
+            return []
+        last_row, last_states = nonempty[-1]
+        state_index = min(range(len(last_states)), key=lambda i: last_states[i][0])
+        chosen = []
+        for row_index in range(last_row, -1, -1):
+            if not states[row_index]:
+                continue
+            state = states[row_index][state_index]
+            chosen.append((state[2], row_candidates[row_index][state_index]['y'],
+                           int(round(state[3]))))
+            parent = state[1]
+            if parent is None:
+                break
+            state_index = parent
+        chosen.reverse()
+        if len(chosen) < 3:
+            return []
+        span = chosen[-1][1] - chosen[0][1]
+        if span < max(24, int(round(roi_h * 0.18))):
+            return []
+        return chosen
 
     def _detect_l_corner(self, binary, roi_top):
         """检测单侧横臂的 L 弯；方向 -1=左，+1=右，0=未检测到。"""
