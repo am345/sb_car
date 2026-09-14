@@ -39,6 +39,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('sources', nargs='+', type=Path)
     parser.add_argument('--before', type=Path)
+    parser.add_argument('--rust', action='store_true', help='Compare current Python with opt-in Rust')
     args = parser.parse_args()
     old_class = ScalarDetector
     if args.before:
@@ -46,8 +47,13 @@ def main():
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         old_class = module.LineDetector
+    new_class = LineDetector
+    if args.rust:
+        from core.rust_line_detector import LineDetector as RustDetector
+        old_class, new_class = LineDetector, RustDetector
+    failures = 0
     for source in args.sources:
-        before, after = detector(old_class), detector(LineDetector)
+        before, after = detector(old_class), detector(new_class)
         paths = sorted(source.rglob('*.jpg')) if source.is_dir() else [source]
         times = [[], []]
         counts = [0, 0]
@@ -59,13 +65,17 @@ def main():
                 unreadable += 1
                 continue
             frame = clean(image)
-            results = []
-            for i, d in enumerate((before, after)):
+            results = [None, None]
+            # Alternate order to avoid consistently giving one backend a warm CPU/cache.
+            order = ((0, before), (1, after))
+            if len(times[0]) % 2:
+                order = order[::-1]
+            for i, d in order:
                 start = time.perf_counter()
                 result = d.process(frame)
                 times[i].append((time.perf_counter()-start)*1000)
                 counts[i] += int(bool(result['corner_dir']))
-                results.append(result)
+                results[i] = result
             old, new = results
             detail_keys = ('binary', 'points', 'fit_coeffs', 'branch_candidates',
                            'selected_branch_direction', 'corner_point',
@@ -87,6 +97,10 @@ def main():
                           'mean_ms': [float(np.mean(t)) for t in times],
                           'p95_ms': [float(np.percentile(t, 95)) for t in times]},
                          ensure_ascii=True), flush=True)
+        failures += len(changed) + len(numeric_changed) + len(detail_changed)
+        failures += int(not times[0])
+    if failures:
+        raise SystemExit(1)
 
 
 def same(a, b):

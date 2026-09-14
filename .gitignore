@@ -21,6 +21,7 @@ image_logs/
 *.mp4
 *.avi
 *.bin
+/rust/**/target/
 
 # Webots generated reports and camera captures
 /webots_line_follow_prototype/*.json
