@@ -7,7 +7,7 @@ import unittest
 import urllib.error
 import urllib.request
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -18,6 +18,32 @@ from debug_web import CONFIG_SCHEMA, DebugWebServer
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_batched_row_segments_preserve_empty_full_and_split_rows(self):
+        rng = np.random.default_rng(42)
+        mask = (rng.random((80, 100)) > .4).astype(np.uint8)*255
+        mask[0] = 0
+        mask[1] = 255
+        actual = LineDetector._row_segments(mask)
+        for y, row in enumerate(mask):
+            xs = np.flatnonzero(row)
+            groups = np.split(xs, np.flatnonzero(np.diff(xs) > 1)+1)
+            expected = [(int(g[0]), int(g[-1]), len(g)) for g in groups if len(g)]
+            self.assertEqual(actual[y], expected)
+
+    def test_corner_stem_batch_fit_keeps_outliers_out_with_one_least_squares(self):
+        points = [(100.0 + 0.25*y, y, 20) for y in range(50)]
+        points = [(x + (40 if y % 5 == 0 else 0), y, w)
+                  for x, y, w in points]
+        expected, expected_inliers = LineDetector._robust_linear_fit(
+            points, residual_limit=3.0)
+        with patch('core.line_follower.np.polyfit', wraps=np.polyfit) as fit:
+            actual, inliers = LineDetector._batch_corner_stem_fit(
+                points, residual_limit=3.0)
+        np.testing.assert_allclose(actual, expected, atol=1e-9)
+        self.assertEqual(inliers, expected_inliers)
+        self.assertEqual(len(inliers), 40)
+        self.assertEqual(fit.call_count, 1)
+
     def runner(self, speed=300):
         chassis = Mock()
         chassis.send_speed.return_value = True
@@ -54,6 +80,20 @@ class IntegrationTests(unittest.TestCase):
         r.last_feedback = None
         with self.assertRaisesRegex(RuntimeError, '底盘反馈'):
             r.set_armed(True, 120)
+
+    def test_forward_speed_range_accepts_400_and_rejects_401(self):
+        r = self.runner(0)
+        r.armed = False
+        r.last_feedback = time.monotonic()
+
+        result = r.set_armed(True, 400)
+
+        self.assertTrue(result['chassis_armed'])
+        self.assertEqual(r.f.base_speed, 400)
+        r.set_armed(False)
+        with self.assertRaisesRegex(ValueError, '1~400'):
+            r.set_armed(True, 401)
+        self.assertEqual(CONFIG_SCHEMA['speed'][2], 400)
 
     def test_command_gate_estop_covers_all_axes(self):
         r = self.runner()
@@ -131,6 +171,86 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('相机', r.fault)
         self.assertTrue(all(call.args==(0,0,0) for call in chassis.send_speed.call_args_list[1:]))
 
+    def test_traffic_loop_executes_remembered_right_corner_in_blind_zone(self):
+        camera, chassis, web = Mock(), Mock(), Mock()
+        frame = np.zeros((480, 640, 3), np.uint8)
+        camera.read.return_value = frame
+        chassis.send_speed.return_value = True
+        chassis.read_status.return_value = {
+            'real_x': 0, 'real_y': 0, 'real_z': 0, 'ang_vel_z': 0}
+        web.heartbeat_age.return_value = 0
+        web.get_traffic_status.return_value = {
+            'state': 'ready', 'age_sec': 0, 'sequence': 1,
+            'detections': []}
+        web.restart_requested = False
+        follower = LineFollower(
+            camera, chassis, base_speed=250, web_debug=web,
+            startup_frames=1, ramp_frames=0, corner_delay_frames=1,
+            corner_delay_distance_m=0.0)
+        follower.frame_interval = 0
+        follower.detector = Mock(
+            work_width=320, crop_top_frac=.6, crop_bottom_frac=.5,
+            binary_mode='otsu')
+        follower.detector.process.side_effect = [
+            {'is_valid': True, 'corner_dir': 0,
+             'error_px': 0, 'angle_deg': 0},
+            {'is_valid': True, 'corner_dir': 1, 'corner_y_ratio': .7,
+             'corner_span': 180, 'error_px': 0, 'angle_deg': 0},
+            {'is_valid': True, 'corner_dir': 1, 'corner_y_ratio': .7,
+             'corner_span': 180, 'error_px': 0, 'angle_deg': 0},
+            {'is_valid': True, 'corner_dir': 1, 'corner_y_ratio': .88,
+             'corner_span': 180, 'error_px': 0, 'angle_deg': 0},
+            {'is_valid': False, 'corner_dir': 0,
+             'error_px': 0, 'angle_deg': 0},
+        ]
+        runner = TrafficControlRunner(follower)
+        runner.armed = True
+
+        runner.run(max_frames=5)
+
+        commands = [call.args for call in chassis.send_speed.call_args_list]
+        confirm_updates = [call.args[2] for call in web.update.call_args_list
+                           if call.args[2]['state'] == 'corner-confirm-right']
+        self.assertEqual(len(confirm_updates), 1)
+        self.assertTrue(all(update['speed'] <= 125
+                            for update in confirm_updates))
+        self.assertTrue(any(x == 0 and y == 0 and z < 0
+                            for x, y, z in commands))
+        self.assertTrue(any(call.args[2]['state'] == 'corner-right'
+                            for call in web.update.call_args_list))
+
+    def test_main_path_fit_is_robust_but_strictly_linear(self):
+        points = [(40, 20, 8), (50, 40, 9), (60, 60, 10),
+                  (70, 80, 11), (250, 50, 8)]
+        coeffs, inliers = LineDetector._robust_linear_fit(points)
+
+        self.assertEqual(coeffs[0], 0.0)
+        self.assertAlmostEqual(coeffs[1], 0.5, places=5)
+        self.assertAlmostEqual(coeffs[2], 30.0, places=5)
+        self.assertEqual(len(inliers), 4)
+
+    def test_near_curve_is_validated_before_linear_direction_fit(self):
+        # Regression for a real right-angle approach: a global straight-line
+        # RANSAC fit keeps the distant diagonal but discards every bottom row.
+        # Those bottom rows are still the continuous tape and must determine
+        # near-field presence and the local steering tangent.
+        points = [
+            (51, 168, 27), (61, 174, 35), (71, 180, 43),
+            (83, 187, 50), (94, 193, 47), (108, 200, 47),
+            (122, 206, 45), (138, 213, 59), (140, 219, 62),
+            (140, 226, 65), (140, 232, 58), (140, 239, 54),
+        ]
+        global_fit, global_inliers = LineDetector._robust_linear_fit(points)
+        self.assertIsNotNone(global_fit)
+        self.assertFalse(any(y >= 220 for _, y, _ in global_inliers))
+
+        local_fit, local_points = LineDetector._fit_local_direction(points)
+
+        self.assertIsNotNone(local_fit)
+        self.assertTrue(any(y >= 220 for _, y, _ in local_points))
+        self.assertAlmostEqual(float(np.polyval(local_fit, 239)), 140,
+                               delta=6)
+
     def test_crossing_arms_and_near_geometry(self):
         d = LineDetector()
         for left, right in [(True,True), (True,False), (False,True)]:
@@ -142,6 +262,133 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(result['junction_left'], left)
             self.assertEqual(result['junction_right'], right)
             self.assertEqual(result['corner_dir'], 0)
+
+    def test_preview_piecewise_l_detects_arm_above_control_roi(self):
+        """A forward-facing camera sees the L arm before it enters tracking ROI."""
+        frame = np.full((480, 640, 3), 225, np.uint8)
+        cv2.line(frame, (320, 479), (320, 170), (20, 20, 20), 32)
+        cv2.line(frame, (320, 170), (560, 170), (20, 20, 20), 32)
+        detector = LineDetector(
+            roi_top_ratio=.45, crop_bottom_frac=.70,
+            crop_top_frac=.90, track_half=60, binary_mode='otsu')
+
+        result = detector.process(frame)
+
+        self.assertTrue(result['is_valid'])
+        self.assertEqual(result['corner_dir'], 1)
+        # It is only an early preview; the maneuver must not start yet.
+        self.assertLess(result['corner_y_ratio'], .52)
+
+    def test_preview_piecewise_l_detects_thick_perspective_corner(self):
+        """A thick real-camera L must not lose its arm during skeletonization."""
+        detector = LineDetector()
+        binary = np.zeros((197, 320), np.uint8)
+        cv2.fillPoly(binary, [np.asarray([
+            (122, 196), (157, 196), (158, 121), (162, 95),
+            (290, 101), (291, 97), (144, 90),
+        ], dtype=np.int32)], 255)
+
+        result = detector._detect_piecewise_corner(
+            binary, preview_top=43, control_top=108,
+            full_height=240, anchor_x=160)
+
+        self.assertEqual(result['corner_dir'], 1)
+
+    def test_preview_reconnects_only_nearby_left_l_arm(self):
+        """A glare-sized break in the real L junction must not erase its arm."""
+        detector = LineDetector()
+        binary = np.zeros((197, 320), np.uint8)
+        cv2.fillPoly(binary, [np.asarray([
+            (54, 107), (164, 111), (164, 123), (54, 119),
+        ], dtype=np.int32)], 255)
+        cv2.fillPoly(binary, [np.asarray([
+            (187, 117), (180, 129), (171, 196), (206, 196),
+            (204, 160), (193, 151), (201, 141), (199, 119),
+        ], dtype=np.int32)], 255)
+
+        result = detector._detect_piecewise_corner(
+            binary, preview_top=43, control_top=108,
+            full_height=240, anchor_x=160)
+
+        self.assertEqual(result['corner_dir'], -1)
+
+    def test_preview_does_not_bridge_distant_or_two_sided_arm(self):
+        detector = LineDetector()
+        stem = np.zeros((197, 320), np.uint8)
+        cv2.fillPoly(stem, [np.asarray([
+            (187, 117), (180, 129), (171, 196), (206, 196),
+            (204, 160), (193, 151), (201, 141), (199, 119),
+        ], dtype=np.int32)], 255)
+        for arm_left, arm_right in ((30, 135), (60, 270)):
+            binary = stem.copy()
+            cv2.rectangle(binary, (arm_left, 107),
+                          (arm_right, 123), 255, -1)
+            result = detector._detect_piecewise_corner(
+                binary, preview_top=43, control_top=108,
+                full_height=240, anchor_x=160)
+            self.assertEqual(result['corner_dir'], 0)
+
+        # Two separate one-sided arms near the same knee are an ambiguous
+        # broken T, not permission to choose the closer branch as an L.
+        binary = stem.copy()
+        cv2.rectangle(binary, (55, 107), (164, 123), 255, -1)
+        cv2.rectangle(binary, (217, 107), (305, 123), 255, -1)
+        result = detector._detect_piecewise_corner(
+            binary, preview_top=43, control_top=108,
+            full_height=240, anchor_x=160)
+        self.assertEqual(result['corner_dir'], 0)
+
+    def test_near_split_cannot_move_preview_l_corner_to_vehicle(self):
+        """Keep direction and distance from the same corner observation."""
+        frame = np.full((480, 640, 3), 225, np.uint8)
+        cv2.line(frame, (320, 479), (320, 170), (20, 20, 20), 32)
+        cv2.line(frame, (320, 170), (560, 170), (20, 20, 20), 32)
+        detector = LineDetector(
+            roi_top_ratio=.45, crop_bottom_frac=.70,
+            crop_top_frac=.90, track_half=60, binary_mode='otsu')
+        detector._detect_split_branches = Mock(return_value=[{
+            'direction': 'right', 'target_x': 245.0, 'split_y': 220.0,
+            'points': [(160, 220, 20), (190, 190, 15), (245, 160, 12)],
+        }])
+
+        result = detector.process(frame)
+
+        self.assertEqual(result['corner_dir'], 1)
+        self.assertLess(result['corner_point'][1], result['roi_top'])
+        self.assertLess(result['corner_y_ratio'], .52)
+        self.assertFalse(result['junction_left'])
+        self.assertFalse(result['junction_straight'])
+        self.assertFalse(result['junction_right'])
+        self.assertEqual(result['branch_candidates'], [])
+
+    def test_preview_piecewise_corner_rejects_smooth_curve(self):
+        frame = np.full((480, 640, 3), 225, np.uint8)
+        points = np.asarray([
+            (320, 479), (319, 430), (315, 380), (305, 330),
+            (288, 285), (265, 245), (235, 210), (200, 180),
+        ], dtype=np.int32)
+        cv2.polylines(frame, [points], False, (20, 20, 20), 32)
+        detector = LineDetector(
+            roi_top_ratio=.45, crop_bottom_frac=.70,
+            crop_top_frac=.90, track_half=60, binary_mode='otsu')
+
+        result = detector.process(frame)
+
+        self.assertTrue(result['is_valid'])
+        self.assertEqual(result['corner_dir'], 0)
+
+    def test_preview_piecewise_corner_rejects_t_junction(self):
+        frame = np.full((480, 640, 3), 225, np.uint8)
+        cv2.line(frame, (320, 479), (320, 170), (20, 20, 20), 32)
+        cv2.line(frame, (80, 170), (560, 170), (20, 20, 20), 32)
+        detector = LineDetector(
+            roi_top_ratio=.45, crop_bottom_frac=.70,
+            crop_top_frac=.90, track_half=60, binary_mode='otsu')
+
+        result = detector.process(frame)
+
+        self.assertTrue(result['is_valid'])
+        self.assertEqual(result['corner_dir'], 0)
 
     def test_broad_porous_floor_shadow_is_not_a_track_or_l_turn(self):
         frame = np.full((480, 640, 3), 220, np.uint8)
@@ -160,6 +407,34 @@ class IntegrationTests(unittest.TestCase):
 
         self.assertFalse(result['is_valid'])
         self.assertEqual(result['corner_dir'], 0)
+
+    def test_wide_near_curve_connected_to_distant_cross_line_is_kept(self):
+        frame = np.full((480, 640, 3), 225, np.uint8)
+        cv2.line(frame, (32, 288), (608, 288), (25, 25, 25), 14)
+        centers = np.asarray([
+            (520, 288, 70), (500, 330, 80), (450, 380, 100),
+            (390, 430, 120), (340, 479, 130),
+        ], dtype=np.float64)
+        left = np.column_stack((centers[:, 0] - centers[:, 2] / 2,
+                                centers[:, 1]))
+        right = np.column_stack((centers[:, 0] + centers[:, 2] / 2,
+                                 centers[:, 1]))[::-1]
+        cv2.fillPoly(frame, [np.rint(np.vstack((left, right))).astype(np.int32)],
+                     (25, 25, 25))
+        model = {
+            'horizontal_fov_deg': 100, 'camera_height_m': .23,
+            'pitch_down_deg': 8, 'segmentation_scale': 1.8,
+            'min_width_mm': 30, 'max_width_mm': 60,
+        }
+        detector = LineDetector(
+            roi_top_ratio=.6, crop_bottom_frac=.7,
+            crop_top_frac=.9, track_half=60, binary_mode='otsu',
+            line_width_model=model, enforce_width=False)
+
+        result = detector.process(frame)
+
+        self.assertTrue(result['is_valid'])
+        self.assertGreaterEqual(len(result['points']), 3)
 
     def test_real_width_calibration_accepts_only_30_to_60_mm_tape(self):
         model = {
@@ -192,6 +467,99 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(nominal['is_valid'])
         self.assertAlmostEqual(nominal['line_width_mm'], 50, delta=3)
         self.assertFalse(too_large['is_valid'])
+
+    def test_relaxed_metric_guard_keeps_solid_tape_but_rejects_extremes(self):
+        model = {
+            'horizontal_fov_deg': 100, 'camera_height_m': .23,
+            'pitch_down_deg': 8, 'segmentation_scale': .55,
+            'min_width_mm': 10, 'max_width_mm': 100,
+        }
+
+        def detect(raw_pixel_width):
+            frame = np.full((480, 640, 3), 225, np.uint8)
+            left = 320 - raw_pixel_width // 2
+            cv2.rectangle(frame, (left, 288),
+                          (left + raw_pixel_width - 1, 479),
+                          (0, 0, 0), -1)
+            detector = LineDetector(
+                roi_top_ratio=.6, crop_bottom_frac=.7,
+                crop_top_frac=.9, track_half=80, binary_mode='otsu',
+                line_width_model=model, enforce_width=True)
+            return detector.process(frame)
+
+        too_thin = detect(4)
+        nominal = detect(50)
+        too_wide = detect(200)
+
+        self.assertFalse(too_thin['is_valid'])
+        self.assertTrue(nominal['is_valid'])
+        self.assertGreaterEqual(nominal['line_width_mm'], 10)
+        self.assertLessEqual(nominal['line_width_mm'], 100)
+        self.assertFalse(too_wide['is_valid'])
+
+    def test_glare_gap_inside_straight_tape_does_not_create_curve(self):
+        frame = np.full((480, 640, 3), 225, np.uint8)
+        tape = np.asarray([
+            (298, 288), (342, 288), (360, 479), (280, 479),
+        ], dtype=np.int32)
+        cv2.fillPoly(frame, [tape], (10, 10, 10))
+        # A bright floor reflection removes the middle/right part of the
+        # otherwise straight ribbon for several consecutive scan rows.
+        cv2.rectangle(frame, (310, 350), (340, 420), (245, 245, 245), -1)
+        model = {
+            'horizontal_fov_deg': 100, 'camera_height_m': .23,
+            'pitch_down_deg': 8, 'segmentation_scale': .55,
+            'min_width_mm': 10, 'max_width_mm': 100,
+        }
+        detector = LineDetector(
+            roi_top_ratio=.6, crop_bottom_frac=.7,
+            crop_top_frac=.9, track_half=60, binary_mode='otsu',
+            line_width_model=model, enforce_width=True)
+
+        result = detector.process(frame)
+
+        self.assertTrue(result['is_valid'])
+        self.assertGreaterEqual(len(result['points']), 10)
+        self.assertLess(abs(result['error_px']), 5)
+        self.assertLess(abs(result['angle_deg']), 5)
+
+    def test_bounded_hysteresis_restores_attached_reflective_tape_only(self):
+        gray = np.full((60, 100), 220, np.uint8)
+        gray[:, 40:60] = 20
+        # Specular glare lifts one side of the tape above the strict threshold.
+        gray[20:40, 50:60] = 125
+        # A similarly grey but disconnected floor mark must not be introduced.
+        gray[20:40, 82:92] = 125
+        # Nor may a weak scratch touching the outside of the tape grow merely
+        # because it is connected to a strict tape seed.
+        gray[5:15, 35:40] = 125
+        inside = np.ones_like(gray, dtype=bool)
+        detector = LineDetector(polarity='black')
+        strict = detector._apply_global_threshold(gray, inside, 100)
+
+        repaired = detector._recover_reflective_tape(
+            gray, strict, inside, threshold=100)
+
+        self.assertTrue(np.all(repaired[22:38, 52:58] == 255))
+        self.assertTrue(np.all(repaired[22:38, 84:90] == 0))
+        self.assertTrue(np.all(repaired[7:13, 36:39] == 0))
+
+    def test_reflective_tape_end_is_extended_only_toward_near_field(self):
+        gray = np.full((60, 100), 220, np.uint8)
+        gray[:42, 40:60] = 20
+        # Reflection erases the final near-field portion of an otherwise
+        # vertical stem, while its grey pixels remain connected below it.
+        gray[42:, 40:60] = 205
+        inside = np.ones_like(gray, dtype=bool)
+        detector = LineDetector(polarity='black')
+        strict = detector._apply_global_threshold(gray, inside, 100)
+
+        repaired = detector._recover_reflective_tape(
+            gray, strict, inside, threshold=100)
+
+        self.assertTrue(np.all(repaired[48:58, 43:57] == 255))
+        self.assertTrue(np.all(repaired[48:58, :35] == 0))
+        self.assertTrue(np.all(repaired[48:58, 65:] == 0))
 
     def test_branch_candidates_keep_relative_direction_ids(self):
         corner = {'corner_point': (160, 150), 'corner_span': 180,
@@ -266,6 +634,21 @@ class IntegrationTests(unittest.TestCase):
             'is_valid': True, 'error_px': 70, 'angle_deg': 60,
             'selected_branch_direction': 'right'}, .1)
         self.assertEqual(abs(command[2]), 800)
+
+    def test_tracking_slows_on_early_curve_before_large_lateral_error(self):
+        runner = self.runner()
+        runner.f.kp = 12.0
+        runner.f.kd = 0.0
+        runner.f.ka = 3.5
+        runner.f.err_alpha = 1.0
+        runner.f.z_rate_limit = 800
+        runner.f.z_invert = True
+        runner.policy.state = 'driving'
+        command = runner._tracking({
+            'is_valid': True, 'error_px': 15, 'angle_deg': 10,
+            'selected_branch_direction': None}, .1)
+        self.assertLessEqual(command[0], 225)
+        self.assertGreater(command[0], 0)
 
     def test_tracking_targets_are_delayed_by_odometry_not_frames(self):
         follower = SimpleNamespace(

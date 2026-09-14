@@ -8,7 +8,8 @@ User=bkrc
 SupplementaryGroups=video dialout
 WorkingDirectory=/home/bkrc/traffic_sign_control
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /home/bkrc/traffic_sign_control/run.py --camera 0 --port /dev/ttyACM0 --web --traffic-control --speed 100 --traffic-model /home/bkrc/traffic_sign_control/models/best_deploy.onnx --web-host 127.0.0.1 --web-port 9090
+Environment=RKNN_RUNTIME_LIBRARY=/home/bkrc/Desktop/rknn_model_zoo/3rdparty/rknpu2/Linux/aarch64/librknnrt.so
+ExecStart=/usr/bin/python3 /home/bkrc/traffic_sign_control/run.py --camera /dev/v4l/by-id/usb-HD_Camera_Manufacturer_USB_2.0_Camera-video-index0 --port /dev/serial/by-id/usb-WCH.CN_USB_Single_Serial_0002-if00 --web --traffic-control --speed 100 --traffic-model /home/bkrc/traffic_sign_control/models/yolo11n_v6_hardneg_best_fp16.rknn --web-host 127.0.0.1 --web-port 9090
 Restart=always
 RestartSec=3
 KillSignal=SIGINT

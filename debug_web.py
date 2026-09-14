@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # 网页允许修改的参数与安全范围。类型、范围在服务端再校验，
 # 不信任浏览器提交的内容。
 CONFIG_SCHEMA = {
-    'speed': (int, 0, 300),
+    'speed': (int, 0, 400),
     'max_z': (int, 0, 1500),
     'kp': (float, 0.0, 50.0),
     'kd': (float, 0.0, 20.0),
@@ -36,6 +36,7 @@ CONFIG_SCHEMA = {
     'ramp_frames': (int, 0, 200),
     'corner_delay_frames': (int, 0, 200),
     'corner_delay_speed': (int, 0, 300),
+    'corner_delay_distance': (float, 0.0, 0.5),
     'corner_turn_degrees': (float, 10.0, 180.0),
     'corner_turn_speed': (int, 50, 1000),
     'lost_hold': (int, 0, 100),
@@ -131,7 +132,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
       <div id="chassisResult" class="bad" role="status" aria-live="polite"></div></div>
     <div class="chassis-actions">
       <div class="chassis-speed"><label for="chassisSpeed">启动速度 mm/s</label>
-        <input id="chassisSpeed" type="number" min="1" max="300" step="1" value="100"></div>
+        <input id="chassisSpeed" type="number" min="1" max="400" step="1" value="100"></div>
       <button id="chassisToggle" class="chassis-start" type="button" disabled>启动底盘</button>
     </div>
   </section>
@@ -146,6 +147,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
         <div class="metric"><div class="label">横向误差</div><div id="error" class="value">--</div></div>
         <div class="metric"><div class="label">方向角</div><div id="angle" class="value">--</div></div>
         <div class="metric"><div class="label">前进速度</div><div id="speed" class="value">--</div></div>
+        <div class="metric"><div class="label">底盘电压</div><div id="batteryVoltage" class="value">--</div></div>
         <div class="metric"><div class="label">仿真实测速度</div><div id="simSpeed" class="value">--</div></div>
         <div class="metric"><div class="label">仿真实时倍率</div><div id="simRate" class="value">--</div></div>
         <div class="metric"><div class="label">转向速度 mrad/s</div><div id="turn" class="value">--</div></div>
@@ -164,12 +166,11 @@ _DASHBOARD_HTML = r"""<!doctype html>
   </section>
   <section id="trafficPanel" class="card config">
     <h2>交通标志识别</h2>
-    <div id="trafficModeNote" class="config-note">仅识别展示，不控制车辆。黄色框为候选（≥25%），绿色框为有效检测（≥50%），连续 3 帧确认。</div>
+    <div id="trafficModeNote" class="config-note">仅显示置信度 &gt;60% 的识别结果，连续 3 帧确认。</div>
     <div id="trafficBehavior" class="config-note"></div>
     <div id="trafficCooldown" class="config-note"></div>
     <div id="trafficState">未启用</div>
     <div id="trafficRate" class="config-note"></div>
-    <img id="trafficImage" hidden style="width:100%;max-width:800px" alt="交通标志检测画面">
     <div id="trafficResults"></div>
   </section>
   <section class="card config">
@@ -206,6 +207,7 @@ const fields=[
  ['track_half','搜索窗半宽 px','number','1'],['startup_frames','起步确认帧','number','1'],
  ['ramp_frames','加速斜坡帧','number','1'],['corner_delay_frames','L弯转向延迟帧','number','1'],
  ['corner_delay_speed','L弯延迟速度 mm/s','number','1'],
+ ['corner_delay_distance','L弯延迟距离 m','number','0.01'],
  ['corner_turn_degrees','L弯旋转角度 °','number','1'],
  ['corner_turn_speed','L弯旋转速度 mrad/s','number','1'],
  ['lost_hold','失线保持帧','number','1'],
@@ -238,14 +240,12 @@ function refreshTraffic(t){
   $('trafficState').textContent=(states[t.state]||t.state)+(t.error?`：${t.error}`:'')+
     (t.state==='ready'?(t.confirmed?` · 已确认 ${t.confirmed}`:` · 确认 ${t.confirm_count||0}/3`):'');
   $('trafficRate').textContent=t.state==='ready'?`${t.backend||''} · 推理 ${num(t.inference_ms)} ms（${num(t.inference_fps)} FPS） · 结果更新 ${num(t.result_fps)} FPS · 数据年龄 ${num(t.age_sec)} s`:'';
-  const fresh=t.state==='ready'; $('trafficImage').hidden=!fresh;
-  if(fresh && !$('trafficImage').getAttribute('src')) $('trafficImage').src='/traffic.mjpg';
-  if(!fresh) $('trafficImage').removeAttribute('src');
+  const fresh=t.state==='ready';
   $('trafficResults').replaceChildren();
   if(fresh){
     if(!t.detections?.length) $('trafficResults').textContent='当前未检测到标志';
     for(const d of t.detections||[]){
-      const row=document.createElement('div'); row.textContent=`${d.label} · ${(d.confidence*100).toFixed(1)}% · ${d.confidence>=0.5?'有效检测':'低置信度候选'}`;
+      const row=document.createElement('div'); row.textContent=`${d.label} · ${(d.confidence*100).toFixed(1)}% · 有效检测`;
       $('trafficResults').appendChild(row);
     }
   }
@@ -271,8 +271,8 @@ async function refresh(){
     $('chassisToggle').className=chassisArmed?'chassis-stop':'chassis-start';
     $('chassisToggle').disabled=chassisBusy||!chassisAvailable;
     $('chassisSpeed').disabled=chassisArmed||!chassisAvailable;
-    $('trafficModeNote').textContent=d.traffic_control?'交通控制已启用；速度仍受启动上限及安全保护限制。各类别独立三帧确认，停车优先。':'仅识别展示，不控制车辆。连续3帧确认。';
-    if(d.sign_only) $('trafficModeNote').textContent='纯标志控制：不循迹、不等路口；确认后立即动作。环岛仅显示，不执行。无标志时按当前巡航目标直行。';
+  $('trafficModeNote').textContent=d.traffic_control?'交通控制已启用；只接收置信度 >60% 的结果，各类别独立三帧确认，停车优先。':'仅显示置信度 >60% 的识别结果，不控制车辆；连续3帧确认。';
+  if(d.sign_only) $('trafficModeNote').textContent='纯标志控制：只接收置信度 >60% 的结果；确认后立即动作。环岛仅显示，不执行。无标志时按当前巡航目标直行。';
     const b=d.behavior;
     $('trafficBehavior').textContent=b?`行为 ${b.state} · 任务 ${b.task||'无'} · 锁定支路 ${b.locked_branch||'无'} · 巡航目标 ${b.cruise_mm_s} / 硬件上限 ${b.speed_ceiling_mm_s} mm/s · 横移 ${d.lateral_speed||0} mm/s${b.fault?' · 保护停车：'+b.fault:''}`:'';
     $('trafficCooldown').textContent=Object.entries(b?.sign_locks||{}).map(([label,s])=>{
@@ -291,6 +291,9 @@ async function refresh(){
     $('valid').textContent=d.valid?'有效':'无效'; $('valid').className='value '+(d.valid?'ok':'bad');
     $('fps').textContent=num(d.fps); $('error').textContent=`${num(d.error_px)} px`;
     $('angle').textContent=`${num(d.angle_deg)}°`; $('speed').textContent=`${num(d.speed,0)} mm/s`;
+    const voltage=Number(d.battery_voltage), hasVoltage=Number.isFinite(voltage);
+    $('batteryVoltage').textContent=hasVoltage?`${voltage.toFixed(2)} V`:'--';
+    $('batteryVoltage').className='value '+(!hasVoltage?'':voltage<10.5?'bad':voltage<11?'warn':'ok');
     $('simSpeed').textContent=simulation?`${num(d.sim_actual_speed_mm_s,0)} mm/s`:'--';
     $('simRate').textContent=simulation?`${num(d.sim_realtime_factor,2)}×`:'--';
     $('turn').textContent=`${num(d.turn,0)} mrad/s`; $('frame').textContent=`frame ${d.frame_count??'--'}`;
@@ -322,8 +325,8 @@ async function refresh(){
 refresh(); setInterval(refresh,200);
 $('chassisToggle').addEventListener('click',async()=>{
  const enabling=!chassisArmed, speed=Number($('chassisSpeed').value);
- if(enabling&&(!Number.isInteger(speed)||speed<1||speed>300)){
-  $('chassisResult').textContent='启动速度必须是1~300 mm/s的整数。'; return;
+ if(enabling&&(!Number.isInteger(speed)||speed<1||speed>400)){
+  $('chassisResult').textContent='启动速度必须是1~400 mm/s的整数。'; return;
  }
  if(enabling&&!confirm(`确认启动底盘？\n\n车辆将在安全检查通过并连续检测到线路后，以最高 ${speed} mm/s 起步。请确保车辆位于赛道、周围无人。`)) return;
  chassisBusy=true; $('chassisToggle').disabled=true; $('chassisResult').textContent='';
@@ -442,6 +445,8 @@ class DebugWebServer:
         self._chassis_arm_callback = chassis_arm_callback
         self._httpd = None
         self._thread = None
+        self._render_thread = None
+        self._render_job = None
         self._running = False
         self._traffic = None
         self._heartbeat_at = None
@@ -471,6 +476,9 @@ class DebugWebServer:
         self._httpd.dashboard = self
         self.port = self._httpd.server_address[1]
         self._running = True
+        self._render_thread = threading.Thread(
+            target=self._render_loop, name='line-debug-render', daemon=True)
+        self._render_thread.start()
         self._thread = threading.Thread(target=self._httpd.serve_forever,
                                         name='line-debug-web', daemon=True)
         self._thread.start()
@@ -479,11 +487,14 @@ class DebugWebServer:
         logger.info('网页调试已启动: %s', self.url)
 
     def stop(self):
-        if self._traffic is not None:
-            self._traffic.stop()
         with self._condition:
             self._running = False
             self._condition.notify_all()
+        if self._render_thread is not None:
+            self._render_thread.join(timeout=2.0)
+            self._render_thread = None
+        if self._traffic is not None:
+            self._traffic.stop()
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
@@ -505,28 +516,47 @@ class DebugWebServer:
         status['corner_span'] = float(det.get('corner_span', 0.0))
         status['junction_straight'] = bool(det.get('junction_straight', False))
 
-        jpeg = None
         now = time.monotonic()
-        if now - self._last_encode >= self.stream_interval:
-            image = self._compose_debug_frame(frame, det)
-            if image is not None:
-                ok, encoded = cv2.imencode(
-                    '.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
-                if ok:
-                    jpeg = encoded.tobytes()
-                    self._last_encode = now
-
-        if (jpeg is not None and self.image_log_dir and
-                now - self._last_image_log >= self.image_log_interval):
-            self._save_image_log(jpeg, status)
-            self._last_image_log = now
-
         with self._condition:
             self._status = status
-            if jpeg is not None:
+            if (self._running and frame is not None and
+                    getattr(frame, 'size', 0) and
+                    now - self._last_encode >= self.stream_interval):
+                # The control loop only publishes the latest render job.  All
+                # expensive drawing, JPEG encoding and log I/O stay off its
+                # timing-critical thread.
+                self._render_job = (frame.copy(), dict(det), dict(status))
+                self._last_encode = now
+            self._condition.notify_all()
+
+    def _render_loop(self):
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._render_job is not None or not self._running)
+                if not self._running:
+                    return
+                frame, det, status = self._render_job
+                self._render_job = None
+
+            image = self._compose_debug_frame(frame, det)
+            if image is None:
+                continue
+            ok, encoded = cv2.imencode(
+                '.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+            if not ok:
+                continue
+            jpeg = encoded.tobytes()
+            now = time.monotonic()
+            if (self.image_log_dir and
+                    now - self._last_image_log >= self.image_log_interval):
+                self._save_image_log(jpeg, status)
+                self._last_image_log = now
+
+            with self._condition:
                 self._jpeg = jpeg
                 self._sequence += 1
-            self._condition.notify_all()
+                self._condition.notify_all()
 
     def get_status(self):
         with self._condition:
@@ -779,8 +809,11 @@ class DebugWebServer:
         for x, y, width in det.get('points') or []:
             cv2.circle(raw, (int(x * scale), int(y * scale)), 4, (40, 240, 90), -1)
         if det.get('is_valid') and det.get('points'):
-            y0 = min(p[1] for p in det['points'])
-            y1 = max(p[1] for p in det['points'])
+            fit_range = det.get('fit_y_range')
+            y0 = (fit_range[0] if fit_range is not None else
+                  min(p[1] for p in det['points']))
+            y1 = (fit_range[1] if fit_range is not None else
+                  max(p[1] for p in det['points']))
             coeffs = det.get('fit_coeffs')
             if coeffs is not None and len(coeffs) == 3:
                 fit_ys = np.linspace(y0, y1, 40)

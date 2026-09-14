@@ -52,6 +52,51 @@ python3 run.py --web --web-port 9000 --web-fps 5
 0.2 秒）。它只延迟明显弯道的新转向方向；小幅修正和出弯回正不延迟。
 `0` 表示关闭，建议实车在 3~6 帧内低速试验。
 
+## YOLO 部署约定：默认使用 RK3588 NPU
+
+后续实机部署统一使用由当前最佳模型转换得到的 FP16 RKNN 模型，
+让 YOLO 在 RK3588 的三核 NPU（`NPU_CORE_0_1_2`）上推理；ONNX 只作为兼容回退，
+不再作为默认实机后端。暂不使用 INT8，因为量化需要代表性校准集，且可能损失远距离小目标精度。
+
+当前模型文件：
+
+- 原始 ONNX：本机 `outputs/yolo11n_v5_right_from_v4_best.onnx`；工控机 `/home/bkrc/traffic_sign_control/models/best_deploy.onnx`
+- 默认 RKNN：本机 `outputs/best_fp16.rknn`；工控机 `/home/bkrc/traffic_sign_control/models/best_fp16.rknn`
+- RKNN 类别与输入尺寸：`outputs/best_fp16.json`；部署时必须与 `.rknn` 同目录、同文件名主干
+- RKNN SHA-256：`0eebccc60fade4be2b53733257222914b7e2e273ec7ec229f42bdb73f243bc3e`
+- ONNX SHA-256：`716e1fe07a771c41f70ea9d030342f8fe287014f516bacc487b2e38b3a7826b8`
+
+转换使用 Rockchip RKNN-Toolkit2 2.3.2，目标平台为 `rk3588`，输入为 640×640：
+
+```bash
+python work/convert_onnx_to_rknn.py \
+  outputs/yolo11n_v5_right_from_v4_best.onnx \
+  outputs/best_fp16.rknn
+```
+
+转换环境固定使用 ONNX 1.18.0、NumPy 1.26.4 和 OpenCV 4.10，避免工具链版本不兼容。
+工控机安装 `rknn-toolkit-lite2==2.3.2`，并在服务环境中指定运行库：
+
+```ini
+Environment=RKNN_RUNTIME_LIBRARY=/home/bkrc/Desktop/rknn_model_zoo/3rdparty/rknpu2/Linux/aarch64/librknnrt.so
+```
+
+实机启动参数中的模型应为：
+
+```bash
+--traffic-model /home/bkrc/traffic_sign_control/models/best_fp16.rknn
+```
+
+程序会根据 `.rknn` 后缀自动选择 NPU，调试网页应显示 `RKNN NPU FP16`。
+已验证 RKNN 输出形状为 `[1, 15, 8400]`；12 张 right 和 25 张 round 样本与 ONNX 的首选类别均一致，
+最大置信度差约 0.0072。工控机批量测试的中位推理耗时由 ONNX 的约 197 ms 降至 RKNN 的约 49 ms，
+约快 4 倍。更换模型后必须重新检查各类别，尤其是远距离 right，不能只依据速度判断部署成功。
+
+如果底盘暂未连接，只能用 `--vision-only` 检查相机、NPU 和网页，不能据此确认运动控制。
+底盘重新连接后，应先停止视觉预览进程，再启动 `bkrc-traffic-control.service`。
+若 RKNN 运行异常，可将服务的 `--traffic-model` 临时改回上述 ONNX；原服务配置备份在
+`/etc/systemd/system/bkrc-traffic-control.service.onnx-backup`。
+
 ## 提高实验（只规定任务，不限定实现）
 
 ### A1 十字路口

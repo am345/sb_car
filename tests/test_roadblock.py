@@ -27,6 +27,20 @@ class RoadblockTests(unittest.TestCase):
                 np.zeros((1, 15, 8400), np.float32), 1, 0, 0,
                 (640, 640, 3), {i: str(i) for i in range(10)})
 
+    def test_decoder_only_returns_confidence_above_sixty_percent(self):
+        names = {0: 'right'}
+        output = np.zeros((1, 5, 8400), np.float32)
+        output[0, :4, 0] = [160, 320, 40, 40]
+        output[0, 4, 0] = .6
+        output[0, :4, 1] = [480, 320, 40, 40]
+        output[0, 4, 1] = .61
+
+        result = TrafficSignWorker.decode(
+            output, 1, 0, 0, (640, 640, 3), names)
+
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result[0]['confidence'], .61, places=5)
+
     def test_box_is_associated_with_nearest_branch(self):
         follower = SimpleNamespace(
             base_speed=300, max_z=800,

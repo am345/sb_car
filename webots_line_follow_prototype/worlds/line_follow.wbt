@@ -30,7 +30,9 @@ Viewpoint {
   position 0 0 10.5
 }
 TexturedBackground { }
-TexturedBackgroundLight { }
+TexturedBackgroundLight {
+  castShadows FALSE
+}
 
 Solid {
   translation 0 0 -0.015
@@ -72,7 +74,7 @@ SmartMecanum {
     }
     Camera {
       translation 0.115 0 0.10
-      rotation 0 1 0 0.14
+      rotation 0 1 0 0.5235987756
       name "camera"
       fieldOfView 1.57079632679
       width 640

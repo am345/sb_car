@@ -39,7 +39,7 @@ class SignEvents:
                 lock['absent_since'] = None
         self.last_frame = now
         visible = {d.get('label') for d in result.get('detections', [])
-                   if d.get('confidence', 0) >= 0.5}
+                   if d.get('confidence', 0) > 0.6}
         ready = []
         for label in LABELS:
             lock = self.locks.get(label)
@@ -110,9 +110,9 @@ class TrafficBehavior:
                  follow_line=True, cross_lateral_distance_m=0.0,
                  cross_lateral_speed=100):
         self.follow_line = bool(follow_line)
-        # Driver/hardware is currently verified only to 300 mm/s. Keep that
-        # physical ceiling while retaining the requested 400/200 policy state.
-        self.ceiling = max(0, min(300, int(speed_ceiling)))
+        # The configured forward-speed ceiling is bounded independently from
+        # lateral and angular motion limits.
+        self.ceiling = max(0, min(400, int(speed_ceiling)))
         self.advance_m = float(advance_m)  # retained for config compatibility
         if not math.isfinite(self.advance_m) or not 0 <= self.advance_m <= 0.5:
             raise ValueError('路口前进距离必须在 0~0.5 m')
@@ -196,7 +196,7 @@ class TrafficBehavior:
 
     @staticmethod
     def _visible(result, label):
-        return any(d.get('label') == label and d.get('confidence', 0) >= 0.5
+        return any(d.get('label') == label and d.get('confidence', 0) > 0.6
                    for d in result.get('detections', []))
 
     @staticmethod

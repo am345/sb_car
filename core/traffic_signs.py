@@ -9,6 +9,9 @@ import cv2
 import numpy as np
 
 
+CONFIDENCE_THRESHOLD = 0.6
+
+
 class TrafficSignWorker:
     def __init__(self, model_path, interval=0.0):
         self.model_path = model_path
@@ -78,14 +81,16 @@ class TrafficSignWorker:
             raise ValueError('模型输出与类别元数据不匹配（需要640输入的YOLO11格式）')
         rows = output[0].T
         labels, scores = rows[:,4:].argmax(axis=1), rows[:,4:].max(axis=1)
-        mask = scores >= 0.25
+        mask = scores > CONFIDENCE_THRESHOLD
         rows, labels, scores = rows[mask], labels[mask], scores[mask]
         boxes = rows[:,:4].copy()
         boxes[:,:2] -= boxes[:,2:] / 2
         result = []
         for label in np.unique(labels):
             indices = np.flatnonzero(labels == label)
-            kept = cv2.dnn.NMSBoxes(boxes[indices].tolist(), scores[indices].tolist(), 0.25, 0.45)
+            kept = cv2.dnn.NMSBoxes(
+                boxes[indices].tolist(), scores[indices].tolist(),
+                CONFIDENCE_THRESHOLD, 0.45)
             for k in np.asarray(kept).reshape(-1):
                 i = indices[k]
                 x,y,w,h = boxes[i]
@@ -105,7 +110,9 @@ class TrafficSignWorker:
                     from rknnlite.api import RKNNLite
                 metadata = json.loads(Path(self.model_path).with_suffix('.json').read_text())
                 names = {int(k):v for k,v in metadata['names'].items()}
-                if metadata['input_size'] != [640,640] or metadata['output_shape'] != [1,14,8400]:
+                expected_output = [1, 4 + len(names), 8400]
+                if (metadata['input_size'] != [640,640] or
+                        metadata['output_shape'] != expected_output):
                     raise ValueError('RKNN 模型元数据不匹配')
                 runtime = RKNNLite(verbose=False)
                 with private_runtime_library():
@@ -119,7 +126,10 @@ class TrafficSignWorker:
             else:
                 import onnxruntime as ort
                 options = ort.SessionOptions()
-                options.intra_op_num_threads = 4
+                # Reserve CPU capacity for the timing-critical line-following
+                # loop. Sign inference is asynchronous and does not benefit
+                # the chassis from monopolising all four performance cores.
+                options.intra_op_num_threads = 2
                 options.inter_op_num_threads = 1
                 session = ort.InferenceSession(self.model_path, sess_options=options,
                                                providers=['CPUExecutionProvider'])
@@ -153,19 +163,14 @@ class TrafficSignWorker:
                 output = infer(tensor)
                 infer_ms = (time.monotonic()-t0)*1000
                 detections = self.decode(output, ratio, left, top, frame.shape, names)
-                valid = [d for d in detections if d['confidence'] >= 0.5]
+                valid = [d for d in detections
+                         if d['confidence'] > CONFIDENCE_THRESHOLD]
                 label = valid[0]['label'] if valid else None
                 now = time.monotonic()
                 count = count+1 if label and label == last_label and last_finish is not None and now-last_finish < 1.5 else (1 if label else 0)
                 last_label = label
-                for d in detections:
-                    x1,y1,x2,y2 = map(int,d['box'])
-                    color = (0,220,80) if d['confidence'] >= 0.5 else (0,190,255)
-                    cv2.rectangle(frame,(x1,y1),(x2,y2),color,2)
-                    cv2.putText(frame,f"{d['label']} {d['confidence']:.2f}",(x1,max(20,y1)),cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
-                ok, encoded = cv2.imencode('.jpg',frame,[cv2.IMWRITE_JPEG_QUALITY,80])
-                if not ok:
-                    raise RuntimeError('识别画面编码失败')
+                # Text-only preview: keep detection/confirmation unchanged and
+                # omit annotation and JPEG encoding from every inference.
                 finished = time.monotonic()
                 sequence += 1
                 status = {'state':'ready', 'detections':detections, 'sequence':sequence,
@@ -179,7 +184,7 @@ class TrafficSignWorker:
                           'control_enabled':False}
                 last_finish = finished
                 with self._condition:
-                    self._status, self._jpeg, self._result_time = status, encoded.tobytes(), captured_at
+                    self._status, self._jpeg, self._result_time = status, None, captured_at
                     self._condition.notify_all()
         except Exception as exc:
             self._stop.set()

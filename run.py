@@ -45,17 +45,25 @@ from debug_web import CONFIG_SCHEMA, DebugWebServer
 
 _WEB_CONFIG_PATH = os.path.join(_CASE_DIR, 'web_config.json')
 
-# Real-camera width calibration.  Otsu retains about 1/1.8 of the physical
-# tape width on the saved 40-50 mm reference line, so compensate before
-# applying the requested 30-60 mm acceptance range.
+# Approximate real-camera width calibration from the current, known 40--50 mm
+# tape frame.  Camera geometry is estimated, so this is a guard against
+# obvious noise rather than metrology.
 REAL_LINE_WIDTH_MODEL = {
     'horizontal_fov_deg': 100.0,
     'camera_height_m': 0.23,
     'pitch_down_deg': 8.0,
-    'segmentation_scale': 1.8,
-    'min_width_mm': 30.0,
-    'max_width_mm': 60.0,
+    'segmentation_scale': 0.55,
+    'min_width_mm': 10.0,
+    'max_width_mm': 100.0,
 }
+
+
+def _parse_camera_source(value):
+    """Accept either a numeric camera index or a stable V4L2 device path."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _load_web_config(logger):
@@ -72,10 +80,13 @@ def _load_web_config(logger):
 
 def _set_manual_exposure(camera, exposure, logger):
     """用 v4l2 锁定 UVC 摄像头曝光，避免遮挡时自动亮度跳变。"""
-    if not isinstance(camera.device, int):
+    if isinstance(camera.device, int):
+        device_path = f'/dev/video{camera.device}'
+    elif str(camera.device).startswith('/dev/'):
+        device_path = str(camera.device)
+    else:
         logger.warning('当前视频源不是 V4L2 设备，跳过手动曝光')
         return False
-    device_path = f'/dev/video{camera.device}'
     command = [
         'v4l2-ctl', '-d', device_path,
         '-c', 'exposure_auto=1',
@@ -95,8 +106,8 @@ def _set_manual_exposure(camera, exposure, logger):
 
 def main():
     parser = argparse.ArgumentParser(description='04-基于视觉的黑白线循迹')
-    parser.add_argument('--camera', type=int, default=None,
-                        help='USB 摄像头编号（默认自动扫描 0~3）')
+    parser.add_argument('--camera', type=_parse_camera_source, default=None,
+                        help='USB 摄像头编号或 /dev/v4l/by-id 路径（默认自动扫描 0~3）')
     parser.add_argument('--port', type=str, default=None,
                         help='底盘串口，如 COM3（默认自动识别）')
     parser.add_argument('--baud', type=int, default=115200, help='串口波特率')
@@ -126,12 +137,12 @@ def main():
                         help='调试网页监听地址（默认127.0.0.1）')
     parser.add_argument('--web-port', type=int, default=9090,
                         help='调试网页端口（默认9090）')
-    parser.add_argument('--web-fps', type=float, default=8.0,
-                        help='网页图像刷新率上限（默认8 FPS）')
+    parser.add_argument('--web-fps', type=float, default=5.0,
+                        help='网页图像刷新率上限（默认5 FPS）')
     parser.add_argument('--exposure', type=int, default=150,
                         help='摄像头手动曝光值（默认150）')
     parser.add_argument('--speed', type=int, default=160,
-                        help='直道巡航速度 mm/s（底盘限幅 ±300）')
+                        help='直道巡航速度 mm/s（允许范围 0~400）')
     parser.add_argument('--max-z', type=int, default=800,
                         help='最大转向速度 mrad/s，默认 800（约45.8度/s）')
     parser.add_argument('--black', action='store_true', help='黑线白底（默认）')
@@ -164,11 +175,13 @@ def main():
                         help='起步后速度从0平滑加速到目标的帧数(默认20，约1秒)')
     parser.add_argument('--corner-delay-frames', type=int, default=10,
                         help='确认L弯后继续低速直行的帧数（越大越晚转，默认10）')
-    parser.add_argument('--corner-delay-speed', type=int, default=40,
+    parser.add_argument('--corner-delay-speed', type=int, default=150,
                         help='确认L弯后延迟直行阶段的速度 mm/s（默认40）')
-    parser.add_argument('--corner-turn-degrees', type=float, default=78.0,
-                        help='L弯原地旋转的目标角度（度，默认78）')
-    parser.add_argument('--corner-turn-speed', type=int, default=300,
+    parser.add_argument('--corner-delay-distance', type=float, default=0.20,
+                        help='确认L弯后按实测里程继续直行的距离 m（默认0.20）')
+    parser.add_argument('--corner-turn-degrees', type=float, default=80.0,
+                        help='L弯原地旋转的目标角度（度，默认80）')
+    parser.add_argument('--corner-turn-speed', type=int, default=800,
                         help='L弯原地旋转的目标速度 mrad/s（默认300）')
     parser.add_argument('--start-rotate', action='store_true',
                         help='起步时原地转向对准线后再前进(默认关:静止确认后边前进边修正)')
@@ -207,14 +220,14 @@ def main():
     if args.traffic_control:
         if args.vision_only or not args.web:
             parser.error('--traffic-control 要求 --web，且不能与 --vision-only 同用')
-        if not args.traffic_model.lower().endswith('.onnx'):
-            parser.error('交通控制仅使用 CPU ONNX 模型')
+        if not args.traffic_model.lower().endswith(('.onnx', '.rknn')):
+            parser.error('交通控制模型必须是 ONNX 或 RKNN')
         if not 0 <= args.traffic_junction_advance_m <= 0.5:
             parser.error('路口前进距离必须在 0~0.5 m')
         if not any(a == '--speed' or a.startswith('--speed=') for a in sys.argv[1:]):
             args.speed = 0  # Never inherit an old moving speed from web_config.
-        if not 0 <= args.speed <= 300:
-            parser.error('交通控制速度上限必须在 0~300 mm/s')
+        if not 0 <= args.speed <= 400:
+            parser.error('交通控制速度上限必须在 0~400 mm/s')
 
     if args.white:
         polarity = 'white'
@@ -224,7 +237,8 @@ def main():
         polarity = saved_config.get('polarity', 'black')
 
     # 1. USB 摄像头
-    camera = USBCamera(device=args.camera, width=640, height=480, fps=30)
+    camera = USBCamera(device=args.camera, width=640, height=480, fps=30,
+                       latest_frame=True)
     if not camera.open():
         logger.error('无法打开 USB 摄像头(已尝试 0~3)，请检查连接')
         return
@@ -351,6 +365,7 @@ def main():
         ramp_frames=args.ramp_frames,
         corner_delay_frames=args.corner_delay_frames,
         corner_delay_speed=args.corner_delay_speed,
+        corner_delay_distance_m=args.corner_delay_distance,
         corner_turn_degrees=args.corner_turn_degrees,
         corner_turn_speed=args.corner_turn_speed,
         start_rotate=args.start_rotate,
@@ -370,7 +385,7 @@ def main():
         debug=args.debug,
         web_debug=web_debug,
         line_width_model=REAL_LINE_WIDTH_MODEL,
-        enforce_width=False,
+        enforce_width=True,
     )
     follower_holder['follower'] = follower
     logger.info('极性=%s 二值化=%s 裁切(底%.2f/顶%.2f) 搜索窗=%gpx 转向取反=%s',

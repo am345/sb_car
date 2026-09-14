@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 
+from core.corner_maneuver import CornerManeuver
 from core.traffic_behavior import TrafficBehavior
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,14 @@ class TrafficControlRunner:
         self.started = False
         self.last_loop_state = None
         self.last_command = (0, 0, 0)
+        self.corner = CornerManeuver(
+            advance_frames=getattr(follower, 'corner_delay_frames', 10),
+            advance_speed=getattr(follower, 'corner_delay_speed', 150),
+            advance_distance_m=getattr(
+                follower, 'corner_delay_distance_m', 0.20),
+            turn_degrees=math.degrees(getattr(
+                follower, 'corner_turn_radians', math.radians(80.0))),
+            turn_speed=getattr(follower, 'corner_turn_speed', 800))
 
     def _new_policy(self):
         return TrafficBehavior(self.f.base_speed, self.advance_m, self.f.max_z,
@@ -65,7 +74,7 @@ class TrafficControlRunner:
         width = result.get('frame_width')
         boxes = [d for d in result.get('detections', [])
                  if d.get('label') == 'roadblock' and
-                 d.get('confidence', 0) >= 0.5 and len(d.get('box', ())) == 4]
+                 d.get('confidence', 0) > 0.6 and len(d.get('box', ())) == 4]
         if not boxes or len(candidates) < 2 or not width:
             det['blocked_branch'] = None
             det['blocked_branches'] = []
@@ -144,6 +153,7 @@ class TrafficControlRunner:
         self.filtered_error = 0.0
         self.filtered_angle = 0.0
         self.last_turn = 0.0
+        self.corner.reset(clear_exit=True)
         self._clear_control_queue()
         self.last_command = (0, 0, 0)
 
@@ -173,9 +183,9 @@ class TrafficControlRunner:
             try:
                 target_speed = int(speed)
             except (TypeError, ValueError, OverflowError):
-                raise ValueError('启动速度必须是1~300 mm/s的整数') from None
-            if not 1 <= target_speed <= 300:
-                raise ValueError('启动速度必须在1~300 mm/s之间')
+                raise ValueError('启动速度必须是1~400 mm/s的整数') from None
+            if not 1 <= target_speed <= 400:
+                raise ValueError('启动速度必须在1~400 mm/s之间')
 
             now = time.monotonic()
             traffic = self.f.web_debug.get_traffic_status()
@@ -245,7 +255,7 @@ class TrafficControlRunner:
     def _tracking(self, det, dt, odom_distance_m=None, route_id='main'):
         if self.sign_only:
             # Straight cruise; no visual steering, including when no line exists.
-            return (300, 0, 0)
+            return (min(self.policy.cruise, self.policy.ceiling), 0, 0)
         if not det.get('is_valid'):
             self.previous_error = None
             self.last_turn = 0
@@ -309,6 +319,15 @@ class TrafficControlRunner:
         if self.policy.state == 'branch-follow':
             return (round(base), 0, round(z))
         speed = base*curve
+        # Start slowing as soon as the line begins to bend, before the
+        # lateral error or steering command becomes large.  Small straight
+        # line noise stays inside the dead zones; beyond them the speed cap
+        # falls continuously to 35% of cruise speed.
+        error_severity = min(1.0, max(0.0, (abs(err)-8.0)/32.0))
+        angle_severity = min(1.0, max(0.0, (abs(angle)-4.0)/14.0))
+        preview_severity = max(error_severity, angle_severity)
+        preview_scale = max(0.35, 1.0-0.65*preview_severity)
+        speed = min(speed, base*preview_scale)
         if abs(err) > 40:
             speed = min(speed, base*0.3)
         return (round(speed), 0, round(z))
@@ -326,6 +345,7 @@ class TrafficControlRunner:
         last_state = None
         try:
             while not stop_event.is_set():
+                cycle_start = time.monotonic()
                 frame = f.camera.read()
                 now = time.monotonic()
                 dt, previous = max(0.001, now-previous), now
@@ -337,7 +357,9 @@ class TrafficControlRunner:
                     f._last_chassis_status = status
                     f.odometry.update(status, timestamp=now)
                 f.detector.path_preference = self._detector_path_preference()
+                detect_start = time.monotonic()
                 det = f.detector.process(frame)
+                detect_ms = (time.monotonic()-detect_start)*1000.0
                 self.last_line_valid = bool(det.get('is_valid'))
                 result = f.web_debug.get_traffic_status()
                 self._associate_roadblock(result, det)
@@ -359,15 +381,24 @@ class TrafficControlRunner:
                 if self.armed and self.started:
                     if not ready:
                         self.trip('相机/识别/反馈/心跳不可用')
-                    if self.sign_only or det.get('is_valid') or self.policy.state in (
+                    pose = f.odometry.snapshot()
+                    corner_result = self.corner.step(
+                        det, dt,
+                        enabled=(not self.sign_only and
+                                 self.policy.state == 'driving'),
+                        base_speed=f.base_speed, max_z=f.max_z,
+                        z_invert=f.z_invert,
+                        yaw_total_deg=pose.get('odom_yaw_total_deg'),
+                        odom_distance_m=pose.get('odom_distance_m'))
+                    if (self.sign_only or det.get('is_valid') or
+                            self.corner.active or self.policy.state in (
                             'branch-follow', 'cross-lateral', 'cross-reacquire',
-                            'junction-wait', 'red-brake', 'red-hold'):
+                            'junction-wait', 'red-brake', 'red-hold')):
                         self.lost_since = None
                     else:
                         self.lost_since = now if self.lost_since is None else self.lost_since
                         if now-self.lost_since > 2:
                             self.trip('持续失线')
-                    pose = f.odometry.snapshot()
                     route_id = ('branch:' + self.policy.locked_branch
                                 if self.policy.locked_branch else
                                 ('inactive:' + self.policy.state
@@ -381,6 +412,22 @@ class TrafficControlRunner:
                         with self.lock:
                             command = self.policy.step(now, result, det, pose,
                                                        f._last_chassis_status or {}, tracking)
+                            # Traffic safety/task states remain authoritative.
+                            # Only ordinary driving may be replaced by the
+                            # remembered, bounded blind-zone corner maneuver.
+                            if (corner_result is not None and
+                                    corner_result.command is not None and
+                                    self.policy.state == 'driving'):
+                                command = corner_result.command
+                            elif ((self.corner.confirming or
+                                   (corner_result is not None and
+                                    corner_result.command is None)) and
+                                  self.policy.state == 'driving'):
+                                command = (
+                                    min(command[0],
+                                        self.corner.confirmation_speed(
+                                            f.base_speed)),
+                                    command[1], command[2])
                             if self.policy.fault:
                                 self.trip(self.policy.fault)
                 command = self.send(command, stop_event)
@@ -390,6 +437,16 @@ class TrafficControlRunner:
                              if self.last_fault else '底盘未启用')
                 else:
                     state = self.fault or (self.policy.state if self.started else waiting)
+                    if (self.started and not self.fault and
+                            corner_result is not None and
+                            self.policy.state == 'driving'):
+                        state = corner_result.state
+                    elif (self.started and not self.fault and
+                          self.corner.confirming and
+                          self.policy.state == 'driving'):
+                        state = ('corner-confirm-left'
+                                 if self.corner.confirm_direction < 0
+                                 else 'corner-confirm-right')
                 if state != last_state:
                     self.previous_error = None
                     self.last_turn = 0
@@ -408,13 +465,34 @@ class TrafficControlRunner:
                                  'fault': self.last_fault or self.policy.fault},
                     'speed': command[0], 'lateral_speed': command[1], 'turn': command[2],
                     'frame_count': frame_count, 'fps': 1/dt,
+                    'target_fps': 1/max(f.frame_interval, 1e-9),
+                    'camera_read_ms': (now-cycle_start)*1000.0,
+                    'line_detect_ms': detect_ms,
+                    'loop_work_ms': (time.monotonic()-cycle_start)*1000.0,
                     'error_px': det.get('error_px', 0), 'angle_deg': det.get('angle_deg', 0),
                     'binary_mode': f.detector.binary_mode, 'max_z': abs(f.max_z),
                     'control_delay_m': self.control_delay_m,
                     'control_queue_depth': len(self.control_queue),
+                    'corner_phase': self.corner.phase,
+                    'corner_trigger_mode': 'visual-or-distance',
+                    'corner_turn_gate_y_ratio': self.corner.turn_gate_y_ratio,
+                    'corner_confirm_count': self.corner.confirm_count,
+                    'corner_confirm_frames': self.corner.confirm_frames,
+                    'corner_delay_distance_m': self.corner.advance_distance_m,
+                    'corner_turn_deg': math.degrees(self.corner.turn_radians),
+                    'corner_exit_frames': self.corner.exit_frames,
                     'started': self.started, 'start_seen': self.start_count,
                     'startup_frames': f.startup_frames, 'heartbeat_age_sec': f.web_debug.heartbeat_age(),
                     'feedback_age_sec': None if self.last_feedback is None else now-self.last_feedback,
+                    # Expose the controller's measured feedback separately from
+                    # the command above.  A successful serial write only proves
+                    # that Linux accepted the bytes; these fields tell us whether
+                    # the chassis controller actually enabled and moved.
+                    'chassis_flag_stop': (f._last_chassis_status or {}).get('flag_stop'),
+                    'measured_x_mm_s': (f._last_chassis_status or {}).get('real_x'),
+                    'measured_y_mm_s': (f._last_chassis_status or {}).get('real_y'),
+                    'measured_z_rad_s': (f._last_chassis_status or {}).get('real_z'),
+                    'battery_voltage': (f._last_chassis_status or {}).get('battery_voltage'),
                     'junction_left': det.get('junction_left', False),
                     'junction_right': det.get('junction_right', False),
                     'junction_near': det.get('junction_near', False),
@@ -426,7 +504,7 @@ class TrafficControlRunner:
                 frame_count += 1
                 if max_frames is not None and frame_count >= max_frames:
                     break
-                stop_event.wait(max(0, f.frame_interval-(time.monotonic()-now)))
+                stop_event.wait(max(0, f.frame_interval-(time.monotonic()-cycle_start)))
         except KeyboardInterrupt:
             pass
         finally:

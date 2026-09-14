@@ -51,17 +51,18 @@ class BehaviorTests(unittest.TestCase):
         result['sequence'] = 3
         self.assertEqual(e.update(result, 1.3), ['left'])
 
-    def test_speed_policy_is_400_200_but_hardware_ceiling_remains(self):
-        s = Scene(300)
-        for _ in range(25): s.tick()
+    def test_speed_policy_supports_400_and_red40_reduces_to_200(self):
+        s = Scene(400)
+        for _ in range(30): s.tick(tracking=(400, 0, 40))
         self.assertEqual(s.p.cruise, 400)
-        self.assertEqual(s.command[0], 300)
+        self.assertEqual(s.command[0], 400)
         s.confirm('red40')
         self.assertEqual(s.p.cruise, 200)
         self.assertEqual(s.command[0], 200)
         s.confirm('black40')
+        for _ in range(15): s.tick(tracking=(400, 0, 40))
         self.assertEqual(s.p.cruise, 400)
-        self.assertLessEqual(s.command[0], 300)
+        self.assertEqual(s.command[0], 400)
 
     def test_red_never_releases_on_disappearance_only_green(self):
         s = Scene()

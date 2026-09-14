@@ -27,7 +27,8 @@ START_TRANSLATION = [-2.175, 0.0, 0.04]
 CONTROLLER_DIR = Path(__file__).resolve().parent
 PROTOTYPE_ROOT = CONTROLLER_DIR.parents[1]
 WORKSPACE_ROOT = PROTOTYPE_ROOT.parent
-PRODUCTION_ROOT = WORKSPACE_ROOT / "work" / "ipc_webui_patch"
+# Use the checked-out production source directly so simulation and real vehicle share one implementation.
+PRODUCTION_ROOT = WORKSPACE_ROOT
 VISION_DEPS = WORKSPACE_ROOT / "work" / "video_analysis_deps"
 sys.path.insert(0, str(VISION_DEPS))
 sys.path.insert(0, str(PRODUCTION_ROOT))
@@ -44,7 +45,8 @@ logging.basicConfig(
 )
 
 EXPECTED_CORE_HASHES = {
-    "core/line_follower.py": "cf44916e114819664e2d1f82cdce002eb6b41f2c7a4b53fb0b70f879651a5916",
+    "core/line_follower.py": "2566009e5f2bc3322ed24601c11027a2ef5f02bfac7e7751757fec2aa939f119",
+    "core/corner_maneuver.py": "b20662944d5093e6bed13ac7f9c261b9fd2a6e4bcb8414421668ac3937d68e41",
     "core/odometry.py": "69b5645836cedfe7684597742ba2fc4cee84fc11c3553e861bb8135e46aa186b",
 }
 
@@ -263,7 +265,7 @@ camera = WebotsCamera(robot, camera_device)
 chassis = WebotsMecanumChassis(robot)
 trace = TraceSink(robot, chassis)
 self_node = robot.getSelf()
-simulation_control = {"armed": False, "target_speed": 100}
+simulation_control = {"armed": True, "target_speed": 100}
 follower_holder = {}
 
 
@@ -314,15 +316,16 @@ web_config = {
     "exposure": 150,
     "roi_top": 0.45,
     "scan_start": 0.25,
-    "crop_bottom": 0.50,
-    "crop_top": 0.60,
+    "crop_bottom": 0.70,
+    "crop_top": 0.90,
     "track_half": 60.0,
     "startup_frames": 5,
     "ramp_frames": 20,
     "corner_delay_frames": 10,
-    "corner_delay_speed": 40,
-    "corner_turn_degrees": 78.0,
-    "corner_turn_speed": 300,
+    "corner_delay_speed": 150,
+    "corner_delay_distance": 0.20,
+    "corner_turn_degrees": 80.0,
+    "corner_turn_speed": 800,
     "lost_hold": 10,
     "search_frames": 15,
     "threshold": 100,
@@ -349,7 +352,7 @@ output = WebAndTraceSink(trace, web, simulation_control)
 follower = LineFollower(
     camera,
     chassis,
-    base_speed=0,
+    base_speed=100,
     max_z=800,
     kp=12.0,
     kd=1.2,
@@ -362,11 +365,21 @@ follower = LineFollower(
     roi_top_ratio=0.45,
     n_scan_rows=12,
     scan_start_ratio=0.25,
-    crop_bottom_frac=0.50,
-    crop_top_frac=0.60,
+    crop_bottom_frac=0.70,
+    crop_top_frac=0.90,
     track_half=60.0,
     polarity="black",
     binary_mode="otsu",
+    # Same width-aware path as production; diagnostic-only, not a hard gate.
+    line_width_model={
+        "horizontal_fov_deg": 90.0,
+        "camera_height_m": 0.14,
+        "pitch_down_deg": 30.0,
+        "segmentation_scale": 1.0,
+        "min_width_mm": 30.0,
+        "max_width_mm": 60.0,
+    },
+    enforce_width=False,
     z_invert=True,
     # Webots fast mode advances 50 ms per iteration; LineFollower's existing
     # 20 Hz limiter then keeps simulated time and wall time approximately 1:1.
@@ -391,7 +404,7 @@ finally:
             "width": camera.width,
             "height": camera.height,
             "field_of_view_deg": 90.0,
-            "pitch_down_deg": round(math.degrees(0.14), 2),
+            "pitch_down_deg": round(math.degrees(0.5235987756), 2),
             "source_format": "Webots BGRA",
             "detector_format": "OpenCV BGR",
             "detector_work_width": 320,

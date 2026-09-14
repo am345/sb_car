@@ -21,11 +21,11 @@ import logging
 import math
 import threading
 import time
-from itertools import combinations
 
 import cv2
 import numpy as np
 
+from core.corner_maneuver import CornerManeuver
 from core.odometry import ImuOdometry
 
 logger = logging.getLogger(__name__)
@@ -155,6 +155,7 @@ class LineDetector:
         if in_vals.size < 50:
             return self._empty_result(binary=np.zeros_like(blur), roi_top=roi_top)
 
+        threshold = None
         if self.binary_mode == 'adaptive':
             binary = self._adaptive_binary(blur, inside)
         else:
@@ -182,7 +183,10 @@ class LineDetector:
         branch_half = branch_fractions * ww * 0.5
         branch_inside = ((columns >= (center-branch_half)[:, None]) &
                          (columns < (center+branch_half)[:, None]))
-        if self.binary_mode == 'adaptive':
+        shared_window = np.array_equal(inside, branch_inside)
+        if shared_window:
+            branch_binary = binary
+        elif self.binary_mode == 'adaptive':
             branch_binary = self._adaptive_binary(blur, branch_inside)
         else:
             branch_binary = self._apply_global_threshold(
@@ -201,9 +205,13 @@ class LineDetector:
             if bw_ > 8 and bh_ > 8 and fill > 0.85:
                 continue
             branch_mask[branch_labels == index] = 255
+        if self.binary_mode != 'adaptive':
+            branch_mask = self._recover_reflective_tape(
+                blur, branch_mask, branch_inside, threshold)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary = (branch_binary if shared_window else
+                  cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel))
 
         # --- 3. 连通域几何过滤：保留"条带状"线分量（对曲线弯更宽容） ---
         # 一次连通的黑线在图像上是条带。过滤原则：
@@ -222,23 +230,55 @@ class LineDetector:
                 continue
             # 面积极度低→细带；面积高但相对包围盒仍细长(弯段绕行)→也接受
             fill = area / float(bw_ * bh_)          # 0~1，实心色块接近1
-            if bw_ > 8 and bh_ > 8 and fill > 0.85:
-                continue                            # 实心大色块→剔除(防假检)
+            # A genuine straight tape stripe is itself a nearly solid
+            # rectangle.  Fill ratio alone therefore cannot distinguish it
+            # from a shadow.  Only reject a solid component here when it is
+            # also implausibly broad; calibrated metric width performs the
+            # final 10--100 mm guard below on the real vehicle.
+            if (bw_ > ww * 0.30 and bh_ > 8 and fill > 0.85):
+                continue
             # A side-attached, broad porous wedge is typically a floor shadow
             # or furniture edge, not a tape ribbon. Keep central wide blobs so
             # genuine intersections remain available to the branch detector.
             side_attached = x_ <= ww * 0.12 or x_ + bw_ >= ww * 0.88
-            if side_attached and bw_ > ww * 0.30 and bh_ > roi_h * 0.60:
+            if (side_attached and bw_ > ww * 0.30 and
+                    bh_ > roi_h * 0.60 and
+                    not self._side_candidate_reconnects(binary, labels, i,
+                                                        ww, roi_h)):
                 continue
             line_mask[labels == i] = 255
         binary = line_mask
+        if self.binary_mode != 'adaptive':
+            # Recover only from components that already passed strict geometry
+            # filtering. Weak scratches cannot promote themselves into roads.
+            binary = self._recover_reflective_tape(
+                blur, binary, inside, threshold)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         if int(binary.max()) == 0:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
-        # L 弯不能由每行一个中心点的多项式可靠表达。先在完整连通域上
-        # 寻找“纵向主干 + 单侧长横臂”，把方向和拐点位置交给控制状态机。
+        # 普通循迹继续只使用近处 ROI；直角预览单独看更高的区域。这样
+        # 远处横臂可以提前被看见，却不会把桌椅或相邻赛道送进转向拟合。
         corner = self._detect_l_corner(binary, roi_top)
+        if corner.get('corner_dir'):
+            # The near-ROI row-span template is useful for junction geometry,
+            # but an isolated L decision here is not anchored to the path the
+            # vehicle is actually following.  Autonomous L turns are accepted
+            # only from the bottom-anchored connected preview below.
+            corner = self._detect_l_corner(
+                np.zeros((1, binary.shape[1]), np.uint8), roi_top)
+        if not (corner.get('corner_dir') or corner.get('junction_left') or
+                corner.get('junction_right') or
+                corner.get('junction_straight')):
+            preview_top = min(roi_top, int(round(wh * 0.18)))
+            preview_binary = self._build_corner_preview(
+                work, preview_top, threshold)
+            preview_corner = self._detect_piecewise_corner(
+                preview_binary, preview_top, roi_top, wh,
+                self._prev_cx if self._prev_cx is not None else center)
+            if preview_corner.get('corner_dir'):
+                corner = preview_corner
 
         # --- 4. 扫描线 + 滑动搜索窗 ---
         # 预测位置作为搜索窗中心；丢线后重捕获时清空预测窗
@@ -279,21 +319,19 @@ class LineDetector:
                 points = stem_points
 
         # 地缝、反光边缘常只贡献一两个远离主线的扫描点。先选取横向
-        # 位置连续的最长点链，再做稳健二次拟合，避免端点把曲线拉飞。
+        # 位置连续的最长点链，再做稳健直线拟合，避免端点把轨迹拉飞。
         points = self._select_continuous_path(points)
         if len(points) < 3:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
 
-        fit_coeffs, points = self._robust_quadratic_fit(points)
-        if fit_coeffs is None or len(points) < 3:
-            self._prev_cx = None
-            return self._empty_result(binary=binary, roi_top=roi_top)
-
         # 道路线必须延伸到近车头区域。只在 ROI 中上部出现的细长物体
         # （例如电线）即使能提供多个扫描点，也不能向底部外推成道路。
+        # 这里必须检查连续轨迹本身，不能检查直线拟合的内点：急弯并不
+        # 符合单一直线，稳健拟合会恰好删掉最靠近车头的弯道末端。
+        track_points = list(points)
         near_y = roi_top + int(roi_h * 0.80)
-        near_points = [point for point in points if point[1] >= near_y]
+        near_points = [point for point in track_points if point[1] >= near_y]
         if len(near_points) < 2:
             self._prev_cx = None
             return self._empty_result(binary=binary, roi_top=roi_top)
@@ -330,19 +368,37 @@ class LineDetector:
                 self._prev_cx = None
                 return self._empty_result(binary=binary, roi_top=roi_top)
 
+        # 全局稳健直线只用于识别分叉相对主干的位置；真正的控制方向用
+        # 离车辆最近的一小段轨迹拟合局部切线。这样直角弯既不会被判成
+        # 无效，也不会把远处直线外推到车头位置。
+        main_fit_coeffs, _ = self._robust_linear_fit(track_points)
+        fit_coeffs, fit_points = self._fit_local_direction(track_points)
+        if fit_coeffs is None:
+            self._prev_cx = None
+            return self._empty_result(binary=binary, roi_top=roi_top)
+        if main_fit_coeffs is None:
+            main_fit_coeffs = fit_coeffs
+
         split_candidates = self._detect_split_branches(
-            branch_mask, roi_top, ww, fit_coeffs, points)
-        branch_candidates = (split_candidates or
-                             self._branch_candidates(corner, ww))
+            branch_mask, roi_top, ww, main_fit_coeffs, track_points)
+        # A preview L and a near-field split are independent observations.
+        # Never combine the direction from one with the position from the
+        # other: doing so moved a distant L corner to the vehicle bumper and
+        # triggered the maneuver far too early.
+        preview_l = bool(corner.get('corner_dir'))
+        branch_candidates = (self._branch_candidates(corner, ww)
+                             if preview_l else
+                             (split_candidates or
+                              self._branch_candidates(corner, ww)))
         chosen = None
-        if split_candidates:
+        if split_candidates and not preview_l:
             directions = {item['direction'] for item in split_candidates}
             split_y = max(item.get('split_y', roi_top)
                           for item in split_candidates)
             targets = [item['target_x'] for item in split_candidates]
             corner = dict(corner)
             corner.update({
-                'corner_point': (float(np.polyval(fit_coeffs, split_y)),
+                'corner_point': (float(np.polyval(main_fit_coeffs, split_y)),
                                  float(split_y)),
                 'corner_y_ratio': float((split_y-roi_top) /
                                         max(1, roi_h-1)),
@@ -352,7 +408,7 @@ class LineDetector:
                 'junction_right': 'right' in directions,
                 'junction_near': bool((split_y-roi_top) /
                                       max(1, roi_h-1) >= 0.60),
-                'junction_stem_x': float(np.polyval(fit_coeffs, split_y)),
+                'junction_stem_x': float(np.polyval(main_fit_coeffs, split_y)),
             })
             requested = self.path_preference
             if requested == 'continuation':
@@ -363,11 +419,11 @@ class LineDetector:
                 self._captured_turn = requested
             if chosen is not None and chosen['direction'] != 'straight':
                 fit_coeffs = None
-                points = list(chosen['points'])
+                track_points = list(chosen['points'])
+                fit_points = track_points
 
-        # TODO-B4【二次拟合、横向误差与方向角】
-        # 用 x = q2*y^2 + q1*y + q0 描述平滑弯道；车头参考点取
-        # ROI 最底行，方向角取该点切线 dx/dy = 2*q2*y + q1。
+        # 用 x = k*y + b 描述当前局部道路方向。为兼容分支选择和WebUI，
+        # 系数仍保存成 (0, k, b)，但控制与绘图都不再产生二次弯曲。
         ref_y = roi_top + roi_h - 1
         if chosen is not None and chosen['direction'] != 'straight':
             error_px = float(chosen['error_px'])
@@ -387,14 +443,14 @@ class LineDetector:
 
         far_limit = roi_top + int(roi_h * 0.45)
         near_limit = roi_top + int(roi_h * 0.75)
-        far_points = sum(1 for point in points if point[1] <= far_limit)
-        close_points = sum(1 for point in points if point[1] >= near_limit)
+        far_points = sum(1 for point in track_points if point[1] <= far_limit)
+        close_points = sum(1 for point in track_points if point[1] >= near_limit)
         # This is only a per-frame candidate. TrafficBehavior additionally
         # requires three frames and matching forward odometry before treating
         # it as the natural end of the cross branch.
         line_end_candidate = close_points >= 2 and far_points <= 1
 
-        return {
+        result = {
             'is_valid': True,
             'centroid': (cx_fit, float(ref_y)),
             'error_px': float(error_px),          # 线在右 → 正 → 右转
@@ -407,12 +463,99 @@ class LineDetector:
             'selected_branch_direction': (None if chosen is None else
                                           chosen['direction']),
             'line_end_candidate': bool(line_end_candidate),
-            'points': points,                   # 参与拟合的点
+            'points': track_points,             # 连续道路轨迹（不丢弯道点）
+            'fit_y_range': (None if not fit_points else
+                            (float(min(point[1] for point in fit_points)),
+                             float(max(point[1] for point in fit_points)))),
             'binary': binary,
             'roi_top': roi_top,
             'line_type': self.polarity,
         }
+        return self._check_otsu_contrast(work, result)
 
+    @staticmethod
+    def _measure_side_contrast(work, result):
+        """Check full run boundaries against the unthresholded working image."""
+        gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+        height, width = gray.shape
+        binary = result['binary']
+        measurements = []
+        for x, y, _ in result.get('points', []):
+            y, x = int(round(y)), int(round(x))
+            ry = y - result['roi_top']
+            if not (0 <= ry < binary.shape[0] and 0 <= x < width):
+                continue
+            row = binary[ry]
+            if not row[x]:
+                continue
+            left, right = x, x + 1
+            while left > 0 and row[left - 1]:
+                left -= 1
+            while right < width and row[right]:
+                right += 1
+            run_width = right - left
+            band = max(3, min(8, run_width // 4))
+            if left < band + 1 or right + band + 1 > width:
+                continue  # An unseen side is not positive tape evidence.
+            patch = gray[max(0, y - 1):min(height, y + 2)]
+            middle = patch[:, left + run_width // 4:
+                           max(left + run_width // 4 + 1, right - run_width // 4)]
+            tape = float(np.median(middle))
+            a = float(np.median(patch[:, left - band - 1:left - 1]))
+            b = float(np.median(patch[:, right + 1:right + band + 1]))
+            measurements.append((y, a - tape, b - tape))
+        return measurements
+
+    def _check_otsu_contrast(self, work, result):
+        # Otsu can split plain shaded floor into two classes without any tape.
+        # Require two brighter sides on enough rows, tolerating local glare.
+        if not result['is_valid'] or self.binary_mode != 'otsu' or self.polarity != 'black':
+            return result
+        minimum = 12.0  # Gray levels, not a physical-width calibration.
+        measured = self._measure_side_contrast(work, result)
+        supported = sum(min(a, b) >= minimum for _, a, b in measured)
+        required = max(3, math.ceil(len(result.get('points', [])) * .40))
+        diagnostics = dict(contrast_checked_rows=len(measured),
+                           contrast_support_rows=supported,
+                           contrast_required_rows=required,
+                           contrast_min_gray=minimum)
+        if supported < required:
+            self._prev_cx = None
+            result = self._empty_result(binary=result['binary'], roi_top=result['roi_top'])
+            result.update(diagnostics, contrast_reason='insufficient-two-sided-contrast')
+        else:
+            result.update(diagnostics, contrast_reason='passed')
+        return result
+
+    @staticmethod
+    def _side_candidate_reconnects(binary, labels, component_index,
+                                    width, roi_height):
+        """Keep a side-clipped ribbon when its near end is narrow and central.
+
+        An acute turn can enter from an image edge while the near portion is
+        still the same continuous tape ribbon.  Require several lower rows to
+        be narrow and return to the central corridor; broad shadows do not
+        satisfy this geometry and remain rejected.
+        """
+        start = max(0, int(round(roi_height * 0.55)))
+        end = roi_height
+        # Close perspective can make a genuine 40--50 mm tape occupy roughly
+        # 22% of the image.  The former 18% limit rejected those curves when
+        # their far end touched a transverse line and formed one wide blob.
+        max_near_width = max(50.0, width * 0.23)
+        central_left = width * 0.20
+        central_right = width * 0.80
+        hits = []
+        rows = LineDetector._row_segments(labels[start:end] == component_index)
+        for rel_y, runs in enumerate(rows, start):
+            if not runs:
+                continue
+            left, right, run_width = max(runs, key=lambda run: run[2])
+            center = (left + right) * 0.5
+            if run_width <= max_near_width and central_left <= center <= central_right:
+                hits.append(rel_y)
+        return (len(hits) >= 3 and
+                max(hits) - min(hits) >= max(12, int(roi_height * 0.12)))
     def _select_continuous_path(self, points):
         """保留横向连续的最长扫描点链，剔除跳到地缝/反光边缘的点。"""
         if len(points) < 3:
@@ -430,6 +573,53 @@ class LineDetector:
         runs.append(current)
         # 同长度时优先选择延伸到更靠近车头的位置。
         return max(runs, key=lambda run: (len(run), run[-1][1]))
+
+    def _add_reflection_repair(self, segments, l0, rel_y, roi_top,
+                               roi_height, anchor):
+        """Add one plausible outer envelope for a glare-split tape row.
+
+        The binary image is deliberately left untouched so nearby branches
+        and intersections cannot be joined globally.  A synthetic merged run
+        is offered only when adjacent dark fragments enclose the predicted
+        track centre and their full outside width remains physically plausible.
+        """
+        segments = list(segments)
+        if len(segments) < 2:
+            return segments
+        best = None
+        for pair_index, (left, right) in enumerate(
+                zip(segments, segments[1:])):
+            gap = int(right[0] - left[1])
+            outer_width = int(right[1] - left[0])
+            if gap < 2 or gap > min(24, max(4, int(outer_width * 0.55))):
+                continue
+            center = l0 + (left[0] + right[1]) * 0.5
+            # The previous centre may already be displaced a few pixels by
+            # glare, so do not require it to fall exactly inside the white
+            # notch.  It must still lie inside the combined outside edges.
+            if not (l0 + left[0] <= anchor <= l0 + right[1]):
+                continue
+            if abs(center - anchor) > self.track_half * 0.45:
+                continue
+            if self.line_width_model is not None:
+                width_mm = self._physical_line_width_mm(
+                    outer_width, roi_top + rel_y, roi_top + roi_height)
+                if (width_mm is None or not
+                        self.line_width_model['min_width_mm'] <= width_mm <=
+                        self.line_width_model['max_width_mm']):
+                    continue
+            elif outer_width > max(25, self.work_width * 0.18):
+                continue
+            score = abs(center - anchor) + gap * 0.15
+            if best is None or score < best[0]:
+                best = (score, pair_index, (left[0], right[1]))
+        if best is not None:
+            _, pair_index, merged = best
+            # Once validated as one physical ribbon, do not leave its two
+            # damaged halves competing with the repaired centre candidate.
+            segments = (segments[:pair_index] + [merged] +
+                        segments[pair_index + 2:])
+        return segments
 
     @staticmethod
     def _branch_candidates(corner, width):
@@ -462,6 +652,18 @@ class LineDetector:
                            'target_y': target_y})
         return result
 
+    @staticmethod
+    def _row_segments(binary):
+        """Extract exact contiguous foreground runs for all rows in one pass."""
+        edges = np.diff(np.pad((binary != 0).astype(np.int8),
+                               ((0, 0), (1, 1))), axis=1)
+        ys, lefts = np.nonzero(edges == 1)
+        _, rights = np.nonzero(edges == -1)
+        rows = [[] for _ in range(binary.shape[0])]
+        for y, left, right in zip(ys.tolist(), lefts.tolist(), rights.tolist()):
+            rows[y].append((left, right-1, right-left))
+        return rows
+
     def _detect_split_branches(self, binary, roi_top, width,
                                main_fit, main_points):
         """Build simultaneous left/straight/right paths from a shared stem.
@@ -475,24 +677,21 @@ class LineDetector:
         separation = max(18.0, width * 0.055)
         first_row = 0
         last_row = int(roi_h * 0.89)
+        row_segments = self._row_segments(binary)
+        q2, q1, q0 = main_fit
         for rel_y in range(first_row, last_row):
-            xs = np.flatnonzero(binary[rel_y])
-            if xs.size == 0:
-                continue
-            breaks = np.flatnonzero(np.diff(xs) > 1)
-            groups = np.split(xs, breaks + 1)
             full_y = rel_y + roi_top
-            main_x = float(np.polyval(main_fit, full_y))
+            main_x = float((q2*full_y + q1)*full_y + q0)
             minimum = max(self.min_seg_width,
                           int(round(3 + 5 * rel_y / max(1, roi_h-1))))
-            for group in groups:
-                if group.size < minimum:
+            for left, right, run_width in row_segments[rel_y]:
+                if run_width < minimum:
                     continue
-                x = float(np.mean(group))
+                x = (left + right)*0.5
                 delta = x - main_x
                 if abs(delta) >= separation:
                     side_points[1 if delta > 0 else -1].append(
-                        (x, float(full_y), int(group.size)))
+                        (x, float(full_y), run_width))
 
         ordered_main = sorted(main_points, key=lambda point: point[1])
         if len(ordered_main) < 3:
@@ -581,34 +780,28 @@ class LineDetector:
                       key=lambda item: order[item['direction']])
 
     @staticmethod
-    def _robust_quadratic_fit(points, residual_limit=8.0):
-        """穷举三点模型，以内点数量选二次曲线并重新拟合。"""
+    def _robust_linear_fit(points, residual_limit=8.0):
+        """Batch all two-point hypotheses, preserving consensus scoring."""
+        return LineDetector._batch_corner_stem_fit(points, residual_limit)
+
+    @staticmethod
+    def _fit_local_direction(points, max_points=6):
+        """Fit the near-field tangent without discarding a legitimate bend."""
         if len(points) < 3:
             return None, []
-        ys = np.asarray([point[1] for point in points], dtype=np.float64)
-        xs = np.asarray([point[0] for point in points], dtype=np.float64)
-        best_indices = np.arange(len(points))
-        best_score = (-1, float('-inf'))
-        for sample in combinations(range(len(points)), 3):
-            sample_idx = np.asarray(sample)
-            try:
-                coeffs = np.polyfit(ys[sample_idx], xs[sample_idx], 2)
-            except (ValueError, np.linalg.LinAlgError):
-                continue
-            residuals = np.abs(xs - np.polyval(coeffs, ys))
-            inliers = np.flatnonzero(residuals <= residual_limit)
-            if inliers.size < 3:
-                continue
-            score = (int(inliers.size), -float(np.mean(residuals[inliers])))
-            if score > best_score:
-                best_score = score
-                best_indices = inliers
+        ordered = sorted(points, key=lambda point: point[1])
+        local_points = ordered[-min(max_points, len(ordered)):]
+        ys = np.asarray([point[1] for point in local_points],
+                        dtype=np.float64)
+        xs = np.asarray([point[0] for point in local_points],
+                        dtype=np.float64)
+        if np.ptp(ys) < 1.0:
+            return None, []
         try:
-            coeffs = np.polyfit(ys[best_indices], xs[best_indices], 2)
+            slope, intercept = np.polyfit(ys, xs, 1)
         except (ValueError, np.linalg.LinAlgError):
             return None, []
-        inlier_points = [points[int(index)] for index in best_indices]
-        return tuple(float(value) for value in coeffs), inlier_points
+        return (0.0, float(slope), float(intercept)), local_points
 
     # ------------------------------------------------------------------
     def _scan_lines(self, binary, roi_top, ww, inside, pred,
@@ -675,6 +868,8 @@ class LineDetector:
                 if best_s < 0 or end - start > best_e - best_s:
                     best_s, best_e = start, end
 
+            segments = self._add_reflection_repair(
+                segments, l0, rel_y, roi_top, roi_h, anchor)
             minimum = max(self.min_seg_width,
                           round(3 + 5 * rel_y / max(1, roi_h-1)))
             candidates = [s for s in segments if s[1]-s[0] >= minimum]
@@ -738,14 +933,19 @@ class LineDetector:
             candidates = []
             if fg.size:
                 runs = np.split(fg, np.flatnonzero(np.diff(fg) > 1) + 1)
+                segments = [(int(run[0]), int(run[-1]) + 1)
+                            for run in runs]
+                row_anchor = pred if pred is not None else ww / 2.0
+                segments = self._add_reflection_repair(
+                    segments, l0, rel_y, roi_top, roi_h, row_anchor)
                 minimum = max(self.min_seg_width,
                               round(3 + 5 * rel_y / max(1, roi_h - 1)))
                 usable_width = max(1, r0 - l0)
-                for run in runs:
-                    bw = int(run[-1] - run[0] + 1)
+                for start, end in segments:
+                    bw = int(end - start)
                     if bw < minimum:
                         continue
-                    cx = l0 + (float(run[0]) + float(run[-1])) / 2.0
+                    cx = l0 + (float(start) + float(end - 1)) / 2.0
                     edge = min(cx - l0, r0 - 1 - cx)
                     blob_penalty = max(0.0, bw / usable_width - 0.24) * 80.0
                     edge_penalty = 8.0 if edge <= 1 else 0.0
@@ -830,21 +1030,13 @@ class LineDetector:
             'line_end_candidate': False,
         }
         rows = []
-        for y in range(roi_h):
-            xs = np.flatnonzero(binary[y])
-            if xs.size < self.min_seg_width:
+        for y, segments in enumerate(self._row_segments(binary)):
+            if not segments:
                 continue
 
             # 只使用本行最长的连续前景段。直接用 xs[0]~xs[-1] 会把墙脚、
             # 阴影等互不相连的黑块合并成一条很长的“横臂”，造成假 L 弯。
-            breaks = np.flatnonzero(np.diff(xs) > 1)
-            starts = np.r_[0, breaks + 1]
-            ends = np.r_[breaks + 1, xs.size]
-            lengths = ends - starts
-            best = int(np.argmax(lengths))
-            seg_left = int(xs[starts[best]])
-            seg_right = int(xs[ends[best] - 1])
-            seg_width = int(lengths[best])
+            seg_left, seg_right, seg_width = max(segments, key=lambda run: run[2])
             if seg_width >= self.min_seg_width:
                 rows.append((y, seg_left, seg_right, seg_width))
         if len(rows) < 6:
@@ -887,33 +1079,20 @@ class LineDetector:
         # 半边之间跳动。用小规模 RANSAC 找多数一致的主干，不让少数
         # 裂线点把整个真 L 否决掉。
         inlier_tol = max(2.0, normal_width * 0.25)
-        best_inliers = None
-        best_error = float('inf')
-        for i, j in combinations(range(len(stem_rows)), 2):
-            dy = stem_ys[j] - stem_ys[i]
-            if abs(dy) < 1e-6:
-                continue
-            slope = (stem_centers[j] - stem_centers[i]) / dy
-            intercept = stem_centers[i] - slope * stem_ys[i]
-            residual = np.abs(stem_centers -
-                              (slope * stem_ys + intercept))
-            inliers = residual <= inlier_tol
-            count = int(np.count_nonzero(inliers))
-            error = float(np.mean(residual[inliers])) if count else float('inf')
-            if (best_inliers is None or
-                    count > int(np.count_nonzero(best_inliers)) or
-                    (count == int(np.count_nonzero(best_inliers)) and
-                     error < best_error)):
-                best_inliers = inliers
-                best_error = error
+        stem_fit_coeffs, stem_inliers = self._batch_corner_stem_fit(
+            [(float(cx), float(y), i)
+             for i, (cx, y) in enumerate(zip(stem_centers, stem_ys))],
+            inlier_tol)
+        best_inliers = np.zeros(len(stem_rows), dtype=bool)
+        for _, _, index in stem_inliers:
+            best_inliers[index] = True
         required_stem_inliers = max(6, int(math.ceil(len(stem_rows) * 0.50)))
-        if (best_inliers is None or
+        if (stem_fit_coeffs is None or
                 int(np.count_nonzero(best_inliers)) < required_stem_inliers):
             return empty
         stem_ys_fit = stem_ys[best_inliers]
         stem_centers_fit = stem_centers[best_inliers]
-        stem_slope, stem_intercept = np.polyfit(
-            stem_ys_fit, stem_centers_fit, 1)
+        _, stem_slope, stem_intercept = stem_fit_coeffs
         stem_fit = stem_slope * stem_ys_fit + stem_intercept
         stem_rms = float(np.sqrt(np.mean((stem_centers_fit - stem_fit) ** 2)))
         # 车身不一定与进入段完全对齐，允许主干在画面中有一定
@@ -988,6 +1167,452 @@ class LineDetector:
             'junction_normal_width': 0.0,
         }
 
+    def _build_corner_preview(self, work, preview_top, tracking_threshold):
+        """Threshold a wide, forward ROI used only for corner classification."""
+        gray = cv2.cvtColor(work[preview_top:, :], cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        height, width = blur.shape[:2]
+        center = width / 2.0
+        fractions = np.linspace(max(.94, self.crop_top_frac),
+                                max(.70, self.crop_bottom_frac), height)
+        half_widths = fractions * width * .5
+        columns = np.arange(width, dtype=np.float64)[None, :]
+        inside = ((columns >= (center-half_widths)[:, None]) &
+                  (columns < (center+half_widths)[:, None]))
+        if self.binary_mode == 'adaptive':
+            binary = self._adaptive_binary(blur, inside)
+        else:
+            threshold = tracking_threshold
+            if threshold is None:
+                values = blur[inside]
+                threshold = (self.fixed_threshold if self.binary_mode == 'fixed'
+                             else self._otsu(values))
+            binary = self._apply_global_threshold(blur, inside, threshold)
+        return cv2.morphologyEx(
+            binary, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5)))
+
+    @staticmethod
+    def _morphological_skeleton(binary):
+        """Return a one-pixel skeleton without requiring opencv-contrib."""
+        image = (binary != 0).astype(np.uint8) * 255
+        skeleton = np.zeros_like(image)
+        element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        while int(image.max()):
+            eroded = cv2.erode(image, element)
+            opened = cv2.dilate(eroded, element)
+            skeleton = cv2.bitwise_or(
+                skeleton, cv2.subtract(image, opened))
+            image = eroded
+        return skeleton
+
+    @staticmethod
+    def _orthogonal_line_fit(points):
+        values = np.asarray(points, dtype=np.float64)
+        if len(values) < 2:
+            return None, float('inf')
+        mean = values.mean(axis=0)
+        centered = values - mean
+        try:
+            _, _, axes = np.linalg.svd(centered, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return None, float('inf')
+        direction = axes[0]
+        if float(np.dot(direction, values[-1]-values[0])) < 0:
+            direction = -direction
+        residual = centered - np.outer(centered @ direction, direction)
+        rms = float(np.sqrt(np.mean(np.sum(residual*residual, axis=1))))
+        return direction, rms
+
+    @staticmethod
+    def _batch_corner_stem_fit(points, residual_limit):
+        """Score all two-point stem models in batches, then refit once.
+
+        Keep the existing maximum-consensus / mean-residual selection rule.
+        Two points define a line directly; no least-squares solve is needed
+        for each hypothesis. Batches bound the residual matrix size.
+        """
+        if len(points) < 3:
+            return None, []
+        xs = np.asarray([p[0] for p in points], dtype=np.float64)
+        ys = np.asarray([p[1] for p in points], dtype=np.float64)
+        first, second = np.triu_indices(len(points), 1)
+        usable = ys[second] != ys[first]
+        first, second = first[usable], second[usable]
+        if not first.size:
+            return None, []
+        best_score = (-1, float('-inf'))
+        best_indices = np.arange(len(points))
+        for offset in range(0, first.size, 256):
+            i, j = first[offset:offset+256], second[offset:offset+256]
+            slope = (xs[j] - xs[i]) / (ys[j] - ys[i])
+            residual = np.abs(xs[None, :] - (
+                xs[i, None] + slope[:, None] * (ys[None, :] - ys[i, None])))
+            inside = residual <= residual_limit
+            counts = inside.sum(axis=1)
+            mean = np.where(inside, residual, 0.0).sum(axis=1) / np.maximum(counts, 1)
+            winner = int(np.lexsort((mean, -counts))[0])
+            score = (int(counts[winner]), -float(mean[winner]))
+            if score[0] >= 3 and score > best_score:
+                best_score = score
+                best_indices = np.flatnonzero(inside[winner])
+        try:
+            slope, intercept = np.polyfit(ys[best_indices], xs[best_indices], 1)
+        except (ValueError, np.linalg.LinAlgError):
+            return None, []
+        return ((0.0, float(slope), float(intercept)),
+                [points[int(i)] for i in best_indices])
+
+    def _detect_bottom_anchored_row_corner(
+            self, component, preview_top, control_top, full_height, anchor_x,
+            empty):
+        """Recover thick L shapes whose morphological skeleton loses an arm.
+
+        The component has already been proven to reconnect to the near field.
+        Fit its incoming stem from the bottom upward, then look for an abrupt,
+        one-sided row expansion.  This preserves the bottom-anchor safety rule
+        while avoiding dependence on fragile one-pixel skeleton endpoints.
+        """
+        height, width = component.shape[:2]
+        component_rows = self._row_segments(component)
+
+        def segments_at(y):
+            return [run for run in component_rows[y]
+                    if run[2] >= self.min_seg_width]
+
+        max_y = int(np.max(np.nonzero(component)[0]))
+        bottom_start = max(0, max_y - max(24, int(round(height * .25))))
+        bottom_rows = []
+        for y in range(bottom_start, max_y + 1):
+            segments = segments_at(y)
+            if not segments:
+                continue
+            left, right, run_width = min(
+                segments,
+                key=lambda item: (0.0 if item[0] <= anchor_x <= item[1]
+                                  else min(abs(anchor_x-item[0]),
+                                           abs(anchor_x-item[1])),
+                                  -item[2]))
+            bottom_rows.append(((left + right) * .5, y, run_width))
+        if len(bottom_rows) < max(10, int(round(height * .10))):
+            return None
+
+        preliminary_width = float(np.median(
+            [item[2] for item in bottom_rows]))
+        residual_limit = max(3.0, preliminary_width * .20)
+        fit, inliers = self._batch_corner_stem_fit(
+            bottom_rows, residual_limit=residual_limit)
+        if fit is None or len(inliers) < max(10, int(len(bottom_rows) * .60)):
+            return None
+        _, stem_slope, stem_intercept = fit
+        if abs(stem_slope) > 1.10:
+            return None
+        residuals = [abs(cx - (stem_slope*y + stem_intercept))
+                     for cx, y, _ in bottom_rows]
+        stem_rows = [row for row, residual in zip(bottom_rows, residuals)
+                     if residual <= residual_limit]
+        if not stem_rows:
+            return None
+        normal_width = float(np.median([item[2] for item in stem_rows]))
+        stem_rms = float(np.sqrt(np.mean([
+            (cx-(stem_slope*y+stem_intercept))**2
+            for cx, y, _ in stem_rows])))
+        if stem_rms > residual_limit:
+            return None
+
+        rows = []
+        upper_limit = max_y - max(12, int(round(height * .12)))
+        for y in range(0, upper_limit + 1):
+            predicted_x = stem_slope*y + stem_intercept
+            segments = segments_at(y)
+            if not segments:
+                continue
+            # A reflection can split the thick horizontal arm into two runs
+            # on a row even though adjacent rows keep the whole tape in one
+            # connected component.  Aggregate the already-anchored component
+            # instead of silently selecting only the short stem-side run.
+            left = min(item[0] for item in segments)
+            right = max(item[1] for item in segments)
+            run_width = right-left+1
+            gap = min(0.0 if item[0] <= predicted_x <= item[1] else
+                      min(abs(predicted_x-item[0]), abs(predicted_x-item[1]))
+                      for item in segments)
+            if gap <= max(5.0, normal_width * .65):
+                rows.append((y, left, right, run_width, predicted_x, gap))
+        if not rows:
+            return None
+        arm = max(rows, key=lambda item: item[3])
+        arm_y, arm_left, arm_right, span, stem_x, _ = arm
+        span_gate = max(width * .18, normal_width * 3.0)
+        if span < span_gate:
+            return None
+
+        # A true taped corner stays broad for several adjacent rows; a single
+        # noisy scanline or compression scar must not create an L candidate.
+        support_radius = max(4, int(round(height * .05)))
+        broad_support = [item for item in rows
+                         if abs(item[0]-arm_y) <= support_radius and
+                         item[3] >= span_gate * .72]
+        if len(broad_support) < 3:
+            return None
+
+        # Width must expand abruptly from the incoming stem. Smooth curves
+        # broaden progressively and should remain under normal line tracking.
+        lower_gap = max(8, int(round(height * .05)))
+        lower_band = [item[3] for item in rows
+                      if arm_y + lower_gap <= item[0] <=
+                      arm_y + lower_gap + max(14, int(round(height * .12)))]
+        if not lower_band or span < float(np.median(lower_band)) * 2.8:
+            return None
+
+        # A vertical continuation above the arm makes this a T/cross rather
+        # than an autonomous L turn.
+        upper_gap = max(6, int(round(height * .04)))
+        upper_stem = [item for item in rows
+                      if item[0] <= arm_y-upper_gap and
+                      item[5] <= normal_width*.45]
+        if len(upper_stem) >= max(5, int(round(height * .06))):
+            return None
+
+        left_extent = stem_x - arm_left
+        right_extent = arm_right - stem_x
+        min_arm = width * .10
+        margin = max(8.0, normal_width * .50)
+        if left_extent >= min_arm and right_extent >= min_arm:
+            return None
+        if right_extent >= min_arm and right_extent >= left_extent + margin:
+            direction = 1
+        elif left_extent >= min_arm and left_extent >= right_extent + margin:
+            direction = -1
+        else:
+            return None
+
+        absolute_y = float(arm_y + preview_top)
+        result = dict(empty)
+        result.update({
+            'corner_dir': direction,
+            'corner_point': (float(stem_x), absolute_y),
+            'corner_y_ratio': float(np.clip(
+                (absolute_y-float(control_top)) /
+                max(1.0, float(full_height-control_top)), 0.0, 1.0)),
+            'corner_span': float(span),
+        })
+        return result
+
+    @staticmethod
+    def _reconnect_preview_corner_arm(labels, stats, stem_index):
+        """Bridge one short, one-sided gap at the top of the incoming tape.
+
+        This is confined to L classification in the wide preview.  The
+        ordinary tracking mask and its metric-width guard stay untouched.
+        Ambiguous or distant horizontal components are never joined.
+        """
+        height, width = labels.shape
+        stem = labels == stem_index
+        _, stem_top, _, _, _ = stats[stem_index]
+        tip_band = stem[int(stem_top):min(height, int(stem_top) + 14)]
+        _, tip_xs = np.nonzero(tip_band)
+        if tip_xs.size < 4:
+            return None
+        tip_x = float(np.median(tip_xs))
+        max_gap = max(8, int(round(width * .07)))
+        arm_candidates = []
+        for index in range(1, len(stats)):
+            if index == stem_index:
+                continue
+            x, y, bw, bh, area = (int(value) for value in stats[index])
+            if (area < 60 or bw < max(width * .18, bh * 3.0) or
+                    bh > height * .15 or y + bh >= height * .78 or
+                    abs(y + bh * .5 - stem_top) > height * .12):
+                continue
+            left_extent = tip_x - x
+            right_extent = x + bw - 1 - tip_x
+            if (left_extent >= width * .10 and
+                    right_extent >= width * .10):
+                continue                  # disconnected T/cross arm
+            if max(left_extent, right_extent) < width * .18:
+                continue
+            arm_candidates.append(index)
+        if not arm_candidates:
+            return None
+
+        distances = cv2.distanceTransform(
+            (~stem).astype(np.uint8), cv2.DIST_L2, 5)
+        plausible = []
+        for index in arm_candidates:
+            arm = labels == index
+            arm_distances = np.where(arm, distances, np.inf)
+            ay, ax = np.unravel_index(
+                int(np.argmin(arm_distances)), labels.shape)
+            if arm_distances[ay, ax] > max_gap:
+                continue
+            y0, y1 = max(0, ay-max_gap-2), min(height, ay+max_gap+3)
+            x0, x1 = max(0, ax-max_gap-2), min(width, ax+max_gap+3)
+            ys, xs = np.nonzero(stem[y0:y1, x0:x1])
+            if ys.size == 0:
+                continue
+            ys, xs = ys+y0, xs+x0
+            nearest = int(np.argmin((ys-ay)**2 + (xs-ax)**2))
+            sy, sx = int(ys[nearest]), int(xs[nearest])
+            if sy > stem_top + max(14, int(round(height * .12))):
+                continue                  # nearby side mark, not the knee
+            plausible.append((index, (ax, ay), (sx, sy)))
+        if len(plausible) != 1:
+            return None                  # competing arms are ambiguous
+
+        index, arm_point, stem_point = plausible[0]
+        repaired = (stem | (labels == index)).astype(np.uint8) * 255
+        cv2.line(repaired, arm_point, stem_point, 255, 3)
+        return repaired
+
+    def _detect_piecewise_corner(self, binary, preview_top, control_top,
+                                 full_height, anchor_x):
+        """Detect a concentrated heading change on the connected tape path.
+
+        Unlike the legacy row-span template this is rotation invariant: the
+        outgoing arm may appear horizontal or diagonal under perspective.
+        """
+        empty = self._detect_l_corner(np.zeros((1, binary.shape[1]),
+                                                np.uint8), control_top)
+        height, width = binary.shape[:2]
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary, connectivity=8)
+        candidates = []
+        bottom_start = int(round(height * .78))
+        for index in range(1, count):
+            x, y, bw, bh, area = stats[index]
+            if area < 40 or bh < height * .35:
+                continue
+            ys, xs = np.nonzero(labels == index)
+            near = ys >= bottom_start
+            if not np.any(near):
+                continue
+            near_error = float(np.min(np.abs(xs[near]-float(anchor_x))))
+            candidates.append((near_error, -int(area), index))
+        if not candidates:
+            return empty
+        _, _, component_index = min(candidates)
+        component = (labels == component_index).astype(np.uint8) * 255
+        row_corner = self._detect_bottom_anchored_row_corner(
+            component, preview_top, control_top, full_height, anchor_x, empty)
+        if row_corner is not None:
+            return row_corner
+        repaired = self._reconnect_preview_corner_arm(
+            labels, stats, component_index)
+        if repaired is not None:
+            row_corner = self._detect_bottom_anchored_row_corner(
+                repaired, preview_top, control_top, full_height, anchor_x,
+                empty)
+            if row_corner is not None:
+                return row_corner
+        skeleton = self._morphological_skeleton(component)
+        coords = [tuple(value) for value in np.argwhere(skeleton != 0)]
+        if len(coords) < 40:
+            return empty
+        coord_set = set(coords)
+
+        def neighbours(point):
+            y, x = point
+            return [(y+dy, x+dx) for dy in (-1, 0, 1)
+                    for dx in (-1, 0, 1) if (dy or dx) and
+                    (y+dy, x+dx) in coord_set]
+
+        max_y = max(point[0] for point in coords)
+        start = min((point for point in coords if point[0] >= max_y-3),
+                    key=lambda point: abs(point[1]-float(anchor_x)))
+        queue = [start]
+        parent = {start: None}
+        distance = {start: 0}
+        for point in queue:
+            for nxt in neighbours(point):
+                if nxt in distance:
+                    continue
+                distance[nxt] = distance[point] + 1
+                parent[nxt] = point
+                queue.append(nxt)
+        endpoints = [point for point in distance
+                     if len(neighbours(point)) <= 1 and point != start]
+        if not endpoints:
+            endpoints = [max(distance, key=distance.get)]
+        farthest = max(endpoints, key=lambda point: distance[point])
+        far_distance = distance[farthest]
+        if far_distance < max(55.0, height * .38):
+            return empty
+
+        # Two comparably long far endpoints mean a T/cross junction. Do not
+        # turn a branch choice into an autonomous L maneuver.
+        long_ends = [point for point in endpoints
+                     if distance[point] >= far_distance * .58]
+        distinct = []
+        for point in sorted(long_ends, key=lambda p: distance[p], reverse=True):
+            if all(math.hypot(point[0]-other[0], point[1]-other[1]) >= 24
+                   for other in distinct):
+                distinct.append(point)
+        if len(distinct) >= 2:
+            return empty
+
+        path = []
+        point = farthest
+        while point is not None:
+            path.append(point)
+            point = parent.get(point)
+        path.reverse()
+        # Convert (row, column) to (x, y), and thin graph stair-steps before
+        # testing candidate breakpoints.
+        xy = np.asarray([(point[1], point[0]) for point in path],
+                        dtype=np.float64)
+        if len(xy) < 30:
+            return empty
+        stride = max(1, len(xy) // 90)
+        sampled = xy[::stride]
+        if not np.array_equal(sampled[-1], xy[-1]):
+            sampled = np.vstack((sampled, xy[-1]))
+        _, single_rms = self._orthogonal_line_fit(sampled)
+        minimum = max(8, len(sampled) // 6)
+        best = None
+        for split in range(minimum, len(sampled)-minimum):
+            first = sampled[:split+1]
+            second = sampled[split:]
+            first_dir, first_rms = self._orthogonal_line_fit(first)
+            second_dir, second_rms = self._orthogonal_line_fit(second)
+            if first_dir is None or second_dir is None:
+                continue
+            dot = float(np.clip(np.dot(first_dir, second_dir), -1.0, 1.0))
+            turn_deg = math.degrees(math.acos(dot))
+            if not 55.0 <= turn_deg <= 125.0:
+                continue
+            piece_rms = math.sqrt(
+                (first_rms**2*len(first) + second_rms**2*len(second)) /
+                (len(first)+len(second)))
+            score = piece_rms + .03*abs(split-len(sampled)*.5)
+            if best is None or score < best[0]:
+                best = (score, split, first_dir, second_dir,
+                        first_rms, second_rms, piece_rms, turn_deg)
+        if best is None:
+            return empty
+        _, split, first_dir, second_dir, first_rms, second_rms, piece_rms, _ = best
+        straight_limit = max(2.8, height * .018)
+        if (first_rms > straight_limit or second_rms > straight_limit or
+                piece_rms >= single_rms * .58):
+            return empty
+        cross = (float(first_dir[0]*second_dir[1] -
+                       first_dir[1]*second_dir[0]))
+        if abs(cross) < .70:
+            return empty
+        direction = 1 if cross > 0 else -1
+        knee_x, knee_y = sampled[split]
+        absolute_y = float(knee_y + preview_top)
+        y_ratio = ((absolute_y-float(control_top)) /
+                   max(1.0, float(full_height-control_top)))
+        result = dict(empty)
+        result.update({
+            'corner_dir': direction,
+            'corner_point': (float(knee_x), absolute_y),
+            'corner_y_ratio': float(np.clip(y_ratio, 0.0, 1.0)),
+            'corner_span': float(np.linalg.norm(sampled[-1]-sampled[split])),
+        })
+        return result
+
     def _apply_global_threshold(self, blur, inside, threshold):
         """TODO-B2a：根据极性应用一个全局阈值，并保证窗外为 0。"""
         binary = np.zeros_like(blur)
@@ -999,6 +1624,72 @@ class LineDetector:
         else:
             foreground = blur < threshold
         binary[inside & foreground] = 255
+        return binary
+
+    def _recover_reflective_tape(self, gray, strict_binary, inside,
+                                 threshold, margin=30, max_distance=24):
+        """Recover weak-dark tape pixels without globally joining roads.
+
+        Reflection can lift part of black tape just above Otsu's strict
+        threshold. A relaxed pixel is admitted only if its relaxed connected
+        component contains strict tape and it stays near that strict seed.
+        """
+        if self.polarity != 'black' or int(strict_binary.max()) == 0:
+            return strict_binary
+        relaxed_threshold = int(min(245, int(threshold) + int(margin)))
+        weak = ((gray < relaxed_threshold) & inside).astype(np.uint8)
+        if int(weak.max()) == 0:
+            return strict_binary
+
+        _, labels = cv2.connectedComponents(weak, connectivity=8)
+        seed_labels = np.unique(labels[strict_binary != 0])
+        seed_labels = seed_labels[seed_labels != 0]
+        if seed_labels.size == 0:
+            return strict_binary
+        connected = np.isin(labels, seed_labels)
+        distance = cv2.distanceTransform(
+            (strict_binary == 0).astype(np.uint8), cv2.DIST_L2, 3)
+        # Only fill concavities inside the envelope of an already accepted
+        # strict component. This rejects weak scratches protruding from the
+        # tape even if they touch it in the relaxed mask.
+        hull_support = strict_binary.copy()
+        contours, _ = cv2.findContours(
+            strict_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            if len(contour) >= 3 and cv2.contourArea(contour) > 0:
+                cv2.fillConvexPoly(
+                    hull_support, cv2.convexHull(contour), 255)
+        # A reflection may erase the *end* of the near-field stem, which lies
+        # outside its strict convex hull. Permit a short, one-way continuation
+        # toward the image bottom, seeded only by strict pixels in the lower
+        # part of the ROI. It cannot grow upward into an L arm or sideways into
+        # another road.
+        near_start = int(round(strict_binary.shape[0] * 0.55))
+        near_seed = strict_binary.copy()
+        near_seed[:near_start] = 0
+        # Require a genuinely vertical stem. A thin horizontal arm has only a
+        # few pixels per column and must not be projected toward the vehicle.
+        min_vertical_support = max(
+            6, int(round(strict_binary.shape[0] * 0.10)))
+        stem_columns = (np.count_nonzero(near_seed, axis=0) >=
+                        min_vertical_support)
+        stem_seed = near_seed.copy()
+        stem_seed[:, ~stem_columns] = 0
+        reach = min(int(max_distance), strict_binary.shape[0] - 1)
+        downward_support = cv2.dilate(
+            stem_seed, np.ones((reach + 1, 1), np.uint8),
+            anchor=(0, reach), borderType=cv2.BORDER_CONSTANT, borderValue=0)
+        hull_support = cv2.bitwise_or(hull_support, downward_support)
+        weak_recovery = (connected & (distance <= float(max_distance)) &
+                         inside & (hull_support != 0))
+        # The last few centimetres may be saturated almost to floor brightness,
+        # so weak thresholding has no evidence left. A vertically supported
+        # stem may still be continued geometrically for this short distance.
+        end_recovery = ((downward_support != 0) &
+                        (distance <= float(max_distance)) & inside)
+        recovered = weak_recovery | end_recovery
+        binary = strict_binary.copy()
+        binary[recovered] = 255
         return binary
 
     @staticmethod
@@ -1100,10 +1791,11 @@ class LineFollower:
       lost_hold   失线低速直行的帧数上限，超过则停车
       startup_frames 起步确认帧数：连续检测到线这么多帧后车辆才开始前进(默认5)
       ramp_frames    起步后速度从0平滑加速到目标的帧数(默认20，约1秒)
-      corner_delay_frames 确认L弯后低速直行多少帧再转向；越大转得越晚(默认10)
-      corner_delay_speed  L弯延迟直行阶段的速度 mm/s(默认40)
-      corner_turn_degrees L弯原地旋转的目标角度；越大转得越多(默认78度)
-      corner_turn_speed   L弯原地旋转的目标速度 mrad/s(默认300)
+      corner_delay_frames 无里程反馈时的后备延迟帧数(默认10)
+      corner_delay_speed  L弯延迟直行阶段的速度 mm/s(默认150)
+      corner_delay_distance_m 确认L弯后按实测里程前进多少米再转(默认0.20)
+      corner_turn_degrees L弯原地旋转的目标角度；越大转得越多(默认80度)
+      corner_turn_speed   L弯原地旋转的目标速度 mrad/s(默认800)
       start_rotate   起步确认期间是否原地转向对准线(默认False:静止确认后边前进边修正)
     """
 
@@ -1113,8 +1805,9 @@ class LineFollower:
                  err_alpha=0.6, z_rate_limit=120.0,
                  lost_hold=10, search_frames=15,
                  startup_frames=5, ramp_frames=20,
-                 corner_delay_frames=10, corner_delay_speed=40,
-                 corner_turn_degrees=78.0, corner_turn_speed=300,
+                 corner_delay_frames=10, corner_delay_speed=150,
+                 corner_delay_distance_m=0.20,
+                 corner_turn_degrees=80.0, corner_turn_speed=800,
                  start_rotate=False,
                  work_width=320, roi_top_ratio=0.45,
                  n_scan_rows=12, scan_start_ratio=0.25,
@@ -1123,7 +1816,7 @@ class LineFollower:
                  binary_mode='otsu', fixed_threshold=100,
                  adaptive_block=31, adaptive_c=8.0,
                  z_invert=True,   # 转向方向取反（默认 True）
-                 target_fps=20, debug=False, web_debug=None,
+                 target_fps=30, debug=False, web_debug=None,
                  line_width_model=None, enforce_width=False):
         self.camera = camera
         self.chassis = chassis
@@ -1141,9 +1834,17 @@ class LineFollower:
         self.ramp_frames = ramp_frames        # 起步后速度从0平滑加速到目标所用帧数
         self.corner_delay_frames = max(0, int(corner_delay_frames))
         self.corner_delay_speed = max(0, int(corner_delay_speed))
+        self.corner_delay_distance_m = max(
+            0.0, float(corner_delay_distance_m))
         self.corner_turn_radians = math.radians(
             float(np.clip(corner_turn_degrees, 10.0, 180.0)))
         self.corner_turn_speed = int(np.clip(corner_turn_speed, 50, 1000))
+        self.corner = CornerManeuver(
+            advance_frames=self.corner_delay_frames,
+            advance_speed=self.corner_delay_speed,
+            advance_distance_m=self.corner_delay_distance_m,
+            turn_degrees=math.degrees(self.corner_turn_radians),
+            turn_speed=self.corner_turn_speed)
         self.start_rotate = start_rotate      # 起步是否原地转向对准线(默认关，静止确认后前进)
 
         self.detector = LineDetector(
@@ -1303,6 +2004,7 @@ class LineFollower:
         self._corner_phase = ''
         self._corner_turn_radians = 0.0
         self._corner_exit_frames = 0
+        self.corner.reset(clear_exit=True)
 
     def _manual_control_step(self):
         pose = self.odometry.snapshot()
@@ -1488,117 +2190,38 @@ class LineFollower:
                     self._resume_tracking.clear()
 
                 detected_corner = int(det.get('corner_dir', 0))
-                if self._corner_exit_frames > 0:
-                    self._corner_exit_frames -= 1
-                    observed_corner = 0
-                else:
-                    observed_corner = detected_corner
-                corner_near = float(det.get('corner_y_ratio', 0.0)) >= 0.52
-                if (self._corner_dir == 0 and self._started and
-                        det['is_valid'] and observed_corner and corner_near):
-                    self._corner_dir = observed_corner
-                    self._corner_frames = 0
-                    self._corner_phase = 'advance'
-                    self._corner_turn_radians = 0.0
-                    logger.info('识别到%s L 弯，跨度=%.0fpx，立即进入后续流程',
-                                '左' if observed_corner < 0 else '右',
-                                float(det.get('corner_span', 0.0)))
-                elif self._corner_dir == 0:
-                    self._corner_confirm_dir = 0
-                    self._corner_confirm_count = 0
+                suppress_observed = self.corner.exit_frames > 0
+                corner_result = self.corner.step(
+                    det, dt, enabled=self._started,
+                    base_speed=self.base_speed, max_z=self.max_z,
+                    z_invert=self.z_invert,
+                    yaw_total_deg=self.odometry.snapshot().get(
+                        'odom_yaw_total_deg'),
+                    odom_distance_m=self.odometry.snapshot().get(
+                        'odom_distance_m'))
+                observed_corner = 0 if suppress_observed else detected_corner
+                self._corner_dir = self.corner.direction
+                self._corner_frames = self.corner.frames
+                self._corner_phase = self.corner.phase
+                self._corner_turn_radians = self.corner.turn_radians
+                self._corner_exit_frames = self.corner.exit_frames
 
-                corner_handled = False
-                if self._corner_dir:
-                    # 识别到 L 后不立刻转：按可调帧数低速直行，让车身中心
-                    # 到达拐点后再进入有界的原地转向。
-                    if self._corner_phase == 'advance':
-                        if self._corner_frames >= self.corner_delay_frames:
-                            self._corner_phase = 'turn'
-                            self._corner_frames = 0
-                            logger.info('%s L 弯已到近处，开始受限原地转向',
-                                        '左' if self._corner_dir < 0 else '右')
-                        else:
-                            self._corner_frames += 1
-                            z = 0
-                            speed = min(self.corner_delay_speed,
-                                        max(0, int(self.base_speed)))
-                            state = ('corner-delay-left' if self._corner_dir < 0
-                                     else 'corner-delay-right')
-                            if self.base_speed <= 0:
-                                speed = 0
-                            if self.chassis.send_speed(speed, 0, 0):
-                                send_fail = 0
-                            else:
-                                send_fail += 1
-                            corner_handled = True
-
-                    # 出口线转成近似纵向后即可结束，不再强制长时间旋转。
-                    reacquired = (self._corner_phase == 'turn' and
-                                  self._corner_turn_radians >= 0.75 and
-                                  det['is_valid'] and
-                                  observed_corner == 0 and abs(angle) < 35 and
-                                  abs(err) < 55)
-                    if not corner_handled and reacquired:
-                        logger.info('%s L 弯出口已重新捕获',
-                                    '左' if self._corner_dir < 0 else '右')
-                        self._corner_dir = 0
-                        self._corner_frames = 0
-                        self._corner_phase = ''
-                        self._corner_turn_radians = 0.0
-                        self._corner_confirm_dir = 0
-                        self._corner_confirm_count = 0
-                        self._corner_exit_frames = 15
-                        self._has_prev = False
-                        self._last_z = 0.0
-                    elif not corner_handled:
-                        self._corner_frames += 1
-                        self._lost_count = 0
-                        self._has_prev = False
-                        self._filtered_err = 0.0
-                        self._filtered_angle = 0.0
-                        turn_limit = min(abs(float(self.max_z)),
-                                         float(self.corner_turn_speed))
-                        turn_mag = min(turn_limit,
-                                       100.0 + self._corner_frames * 15.0)
-                        raw_z = self._corner_dir * turn_mag
-                        self._last_sign = self._corner_dir
-                        turn_complete = (self._corner_turn_radians >= self.corner_turn_radians or
-                                         self._corner_frames > 110)
-                        if turn_complete:
-                            logger.info('%s L 弯旋转完成 %.1f°，进入低速循迹退出阶段',
-                                        '左' if self._corner_dir < 0 else '右',
-                                        math.degrees(self._corner_turn_radians))
-                            self._corner_dir = 0
-                            self._corner_frames = 0
-                            self._corner_phase = ''
-                            self._corner_turn_radians = 0.0
-                            self._corner_confirm_dir = 0
-                            self._corner_confirm_count = 0
-                            self._corner_exit_frames = 15
-                            self._has_prev = False
-                            self._last_z = 0.0
-                            z = 0
-                            speed = 0
-                            state = 'corner-exit'
-                            if self.chassis.send_speed(0, 0, 0):
-                                send_fail = 0
-                            else:
-                                send_fail += 1
-                            corner_handled = True
-                        else:
-                            self._corner_turn_radians += abs(raw_z) * dt / 1000.0
-                            self._last_z = raw_z
-                            z = -raw_z if self.z_invert else raw_z
-                            if self.base_speed <= 0:
-                                z = 0
-                            speed = 0
-                            state = ('corner-left' if self._corner_dir < 0
-                                     else 'corner-right')
-                            if self.chassis.send_speed(0, 0, int(z)):
-                                send_fail = 0
-                            else:
-                                send_fail += 1
-                            corner_handled = True
+                corner_handled = (corner_result is not None and
+                                  corner_result.command is not None)
+                if corner_handled:
+                    speed, _, z = corner_result.command
+                    state = corner_result.state
+                    self._lost_count = 0
+                    self._has_prev = False
+                    self._filtered_err = 0.0
+                    self._filtered_angle = 0.0
+                    self._last_sign = (self.corner.direction or
+                                       self._last_sign)
+                    self._last_z = (-z if self.z_invert else z)
+                    if self.chassis.send_speed(speed, 0, z):
+                        send_fail = 0
+                    else:
+                        send_fail += 1
 
                 if corner_handled:
                     pass
@@ -1689,14 +2312,29 @@ class LineFollower:
                             # 保留正常循迹转向，只限制前进速度，避免再次触发旧 L。
                             speed = min(speed, int(round(self.base_speed * 0.35)))
                             state = 'corner-exit'
-                        elif observed_corner:
-                            # 拐点尚远时继续沿主干靠近，但预先减速；达到触发线后
-                            # 上面的确认逻辑会切换为原地转向。
-                            speed = min(speed, int(round(self.base_speed * 0.35)))
-                            z = 0
-                            self._last_z = 0.0
-                            state = ('corner-approach-left' if observed_corner < 0
-                                     else 'corner-approach-right')
+                        elif (corner_result is not None and
+                              corner_result.command is None):
+                            speed = min(
+                                speed,
+                                self.corner.confirmation_speed(self.base_speed))
+                            state = corner_result.state
+                        elif self.corner.confirming:
+                            # L 候选出现后仍按当前轨迹转向，只把前进速度压到
+                            # 基础速度的 50%。连续确认完成且拐点到达触发线后，
+                            # CornerManeuver 才接管并进入固定前进/原地转向阶段。
+                            speed = min(
+                                speed,
+                                self.corner.confirmation_speed(self.base_speed))
+                            state = ('corner-confirm-left'
+                                     if self.corner.confirm_direction < 0
+                                     else 'corner-confirm-right')
+                        # Edge warning: slow before a sharp path reaches the
+                        # image boundary, giving the detector time to reacquire.
+                        edge_ratio = abs(float(err)) / max(1.0,
+                                                           self.detector.work_width * 0.5)
+                        if edge_ratio >= 0.55 or abs(float(angle)) >= 18.0:
+                            speed = min(speed, int(round(self.base_speed * 0.50)))
+
                         if self.chassis.send_speed(speed, 0, int(z)):
                             send_fail = 0
                         else:
@@ -1746,9 +2384,12 @@ class LineFollower:
                         'started': self._started,
                         'binary_mode': self.detector.binary_mode,
                         'corner_phase': self._corner_phase,
+                        'corner_confirm_count': self.corner.confirm_count,
+                        'corner_confirm_frames': self.corner.confirm_frames,
                         'corner_exit_frames': self._corner_exit_frames,
                         'corner_delay_frames': self.corner_delay_frames,
                         'corner_delay_speed': self.corner_delay_speed,
+                        'corner_delay_distance_m': self.corner_delay_distance_m,
                         'corner_turn_target_deg': math.degrees(self.corner_turn_radians),
                         'corner_turn_speed': self.corner_turn_speed,
                         'corner_turn_deg': math.degrees(self._corner_turn_radians),
@@ -1894,8 +2535,11 @@ class LineFollower:
             s = disp.shape[1] / self.detector.work_width
             for (x, y, bw) in det['points']:
                 cv2.circle(disp, (int(x * s), int(y * s)), 3, (0, 255, 0), -1)
-            y_top = min(p[1] for p in det['points'])
-            y_bot = max(p[1] for p in det['points'])
+            fit_range = det.get('fit_y_range')
+            y_top = (fit_range[0] if fit_range is not None else
+                     min(p[1] for p in det['points']))
+            y_bot = (fit_range[1] if fit_range is not None else
+                     max(p[1] for p in det['points']))
             fit_ys = np.linspace(y_top, y_bot, 40)
             fit_xs = np.polyval(det['fit_coeffs'], fit_ys)
             curve = np.column_stack((fit_xs * s, fit_ys * s))
